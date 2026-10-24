@@ -1,7 +1,7 @@
 const env = process.env;
 
 export const config = {
-  port: Number(env.PORT ?? 8787),
+  port: Number(env.API_PORT ?? 8787),
   muse: {
     apiKey: env.MODEL_API_KEY ?? "",
     baseUrl: (env.MUSE_BASE_URL ?? "https://api.meta.ai/v1").replace(/\/$/, ""),

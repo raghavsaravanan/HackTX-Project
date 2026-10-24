@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 
-const apiPort = process.env.PORT ?? "8787";
+const apiPort = process.env.API_PORT ?? "8787";
 
 // HTTPS is required for phone camera/mic access over the LAN. Set HTTP=1 for laptop-only use.
 const useHttps = process.env.HTTP !== "1";
