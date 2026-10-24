@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Phone Camera</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="phone">
+  <main>
+    <header>
+      <h1>Phone camera</h1>
+      <span class="room">room <code id="room"></code></span>
+    </header>
+
+    <div class="video-wrap">
+      <video id="preview" autoplay playsinline muted></video>
+    </div>
+
+    <p id="status" class="status" data-state="idle">Connecting to server…</p>
+
+    <div class="controls">
+      <button id="start" class="primary">Start camera</button>
+      <button id="flip" disabled>Flip camera</button>
+      <select id="resolution" aria-label="Resolution">
+        <option value="640x480">480p</option>
+        <option value="1280x720" selected>720p</option>
+        <option value="1920x1080">1080p</option>
+      </select>
+    </div>
+    <p class="hint">Keep this tab open and the screen on while streaming.</p>
+  </main>
+  <script type="module" src="/static/js/phone.js"></script>
+</body>
+</html>
