@@ -54,6 +54,33 @@ def test_signaling_relay_between_sender_and_viewer():
         assert viewer.receive_json() == {"type": "peer-left", "role": "sender"}
 
 
+def test_signaling_replaces_viewer_mdns_hosts_with_lan_ip(monkeypatch):
+    monkeypatch.setattr("app.signaling.lan_ip", lambda: "192.168.1.50")
+    mdns = "a5bf9572-65ea-48dd-b40d-04b37e040ba7.local"
+    client = TestClient(app)
+    with client.websocket_connect("/ws/signal/t2?role=viewer") as viewer:
+        viewer.receive_json()
+        with client.websocket_connect("/ws/signal/t2?role=sender") as sender:
+            sender.receive_json()
+            viewer.receive_json()
+            viewer.send_json({"type": "candidate", "candidate": {
+                "candidate": f"candidate:1 1 udp 2113937151 {mdns} 58552 typ host", "sdpMid": "0"}})
+            got = sender.receive_json()["candidate"]
+            assert got == {"candidate": "candidate:1 1 udp 2113937151 192.168.1.50 58552 typ host", "sdpMid": "0"}
+
+            viewer.send_json({"type": "answer", "sdp": {"type": "answer", "sdp": f"a=candidate:1 1 udp 1 {mdns} 9 typ host"}})
+            assert "192.168.1.50 9 typ host" in sender.receive_json()["sdp"]["sdp"]
+
+
+def test_relay_forwards_phone_frames_to_viewer():
+    client = TestClient(app)
+    frame = _jpeg(64, 48)
+    with client.websocket_connect("/ws/relay/r1?role=viewer") as viewer:
+        with client.websocket_connect("/ws/relay/r1?role=sender") as phone:
+            phone.send_bytes(frame)
+            assert viewer.receive_bytes() == frame
+
+
 def test_frame_ingest_and_latest_endpoint():
     client = TestClient(app)
     with client.websocket_connect("/ws/frames") as ws:

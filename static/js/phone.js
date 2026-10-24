@@ -1,6 +1,7 @@
 // Phone page: capture the camera with getUserMedia() and send it to the viewer
-// over a direct WebRTC peer connection.
-import { RTC_CONFIG, Signaling, roomFromUrl, setStatus } from "./common.js";
+// over a direct WebRTC peer connection, falling back to JPEG frames relayed
+// through the server whenever the direct link isn't connected.
+import { RTC_CONFIG, Signaling, roomFromUrl, setStatus, wsUrl } from "./common.js";
 
 const preview = document.getElementById("preview");
 const statusEl = document.getElementById("status");
@@ -13,6 +14,8 @@ let stream = null;
 let pc = null;
 let facingMode = "environment";
 let viewerPresent = false;
+// ?mode=relay skips WebRTC entirely (for networks that block device-to-device traffic).
+const relayOnly = new URLSearchParams(location.search).get("mode") === "relay";
 
 const signaling = new Signaling(room, "sender", onSignal, (s) => {
   if (s === "closed") setStatus(statusEl, "Reconnecting to server…", "warn");
@@ -41,6 +44,7 @@ async function startCamera() {
   preview.srcObject = stream;
   startBtn.textContent = "Restart camera";
   flipBtn.disabled = false;
+  if (pc?.connectionState !== "connected") startRelay();
 
   const track = stream.getVideoTracks()[0];
   const sender = pc?.getSenders().find((s) => s.track?.kind === "video");
@@ -54,17 +58,23 @@ async function startCamera() {
 }
 
 async function call() {
-  if (!stream) return;
+  if (!stream || relayOnly) return;
   pc?.close();
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  const peer = (pc = new RTCPeerConnection(RTC_CONFIG));
   const transceiver = pc.addTransceiver(stream.getVideoTracks()[0], { direction: "sendonly", streams: [stream] });
   preferHardwareCodec(transceiver);
 
   pc.onicecandidate = (e) => e.candidate && signaling.send({ type: "candidate", candidate: e.candidate });
   pc.onconnectionstatechange = () => {
-    const s = pc.connectionState;
-    if (s === "connected") setStatus(statusEl, "Streaming to laptop ✓", "ok");
-    else if (s === "failed") setStatus(statusEl, "Connection failed – are both devices on the same Wi-Fi?", "error");
+    if (peer !== pc) return;
+    const s = peer.connectionState;
+    if (s === "connected") {
+      stopRelay();
+      setStatus(statusEl, "Streaming to laptop ✓ (direct)", "ok");
+      return;
+    }
+    if (s === "failed" || s === "disconnected" || s === "closed") startRelay();
+    if (relayTimer) setStatus(statusEl, "Streaming to laptop ✓ (via server relay)", "ok");
     else setStatus(statusEl, `WebRTC: ${s}`, "warn");
   };
 
@@ -79,7 +89,47 @@ async function call() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   signaling.send({ type: "offer", sdp: pc.localDescription });
-  setStatus(statusEl, "Connecting to laptop…", "warn");
+  if (!relayTimer) setStatus(statusEl, "Connecting to laptop…", "warn");
+}
+
+// --------------------------------------------------------- relay fallback
+const RELAY_FPS = 8;
+const RELAY_MAX_SIDE = 640;
+const relayCanvas = document.createElement("canvas");
+let relayWs = null;
+let relayTimer = null;
+
+function openRelay() {
+  relayWs = new WebSocket(wsUrl(`/ws/relay/${encodeURIComponent(room)}?role=sender`));
+  relayWs.onclose = () => {
+    relayWs = null;
+    if (relayTimer) setTimeout(() => relayTimer && !relayWs && openRelay(), 1500);
+  };
+}
+
+function startRelay() {
+  if (relayTimer || !stream) return;
+  if (!relayWs) openRelay();
+  relayTimer = setInterval(sendRelayFrame, 1000 / RELAY_FPS);
+  setStatus(statusEl, "Streaming to laptop ✓ (via server relay)", "ok");
+}
+
+function stopRelay() {
+  clearInterval(relayTimer);
+  relayTimer = null;
+  relayWs?.close();
+}
+
+function sendRelayFrame() {
+  // Skip frames while the socket is backed up so latency stays low on slow Wi-Fi.
+  if (relayWs?.readyState !== WebSocket.OPEN || relayWs.bufferedAmount > 256_000 || !preview.videoWidth) return;
+  const scale = Math.min(1, RELAY_MAX_SIDE / Math.max(preview.videoWidth, preview.videoHeight));
+  relayCanvas.width = Math.round(preview.videoWidth * scale);
+  relayCanvas.height = Math.round(preview.videoHeight * scale);
+  relayCanvas.getContext("2d").drawImage(preview, 0, 0, relayCanvas.width, relayCanvas.height);
+  relayCanvas.toBlob((blob) => {
+    if (blob && relayWs?.readyState === WebSocket.OPEN) relayWs.send(blob);
+  }, "image/jpeg", 0.7);
 }
 
 // Phones encode H.264 in hardware; VP8 (Chrome's default pick) is software-encoded
@@ -107,6 +157,7 @@ async function onSignal(msg) {
       viewerPresent = false;
       pc?.close();
       pc = null;
+      startRelay();
       setStatus(statusEl, "Laptop viewer disconnected. Waiting…", "warn");
       break;
     case "answer":

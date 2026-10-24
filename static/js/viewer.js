@@ -3,6 +3,7 @@
 import { RTC_CONFIG, Signaling, roomFromUrl, setStatus, wsUrl } from "./common.js";
 
 const video = document.getElementById("remote");
+const relayCanvas = document.getElementById("relay");
 const placeholder = document.getElementById("placeholder");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
@@ -62,7 +63,7 @@ function scheduleRetry(ms, reason) {
   clearTimeout(retryTimer);
   retryTimer = setTimeout(() => {
     if (pc?.connectionState === "connected") return;
-    setStatus(statusEl, `${reason} – asking the phone to reconnect…`, "warn");
+    if (relayCanvas.hidden) setStatus(statusEl, `${reason} – asking the phone to reconnect…`, "warn");
     signaling.send({ type: "request-offer" });
     scheduleRetry(CONNECT_TIMEOUT_MS, "Still not connected");
   }, ms);
@@ -74,23 +75,22 @@ async function answer(offer) {
   peer.onicecandidate = (e) => e.candidate && signaling.send({ type: "candidate", candidate: e.candidate });
   peer.ontrack = (e) => {
     video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
-    placeholder.hidden = true;
   };
   peer.onconnectionstatechange = () => {
     if (peer !== pc) return;
     const s = peer.connectionState;
     if (s === "connected") {
       clearTimeout(retryTimer);
-      setStatus(statusEl, "Live from phone ✓", "ok");
-    } else if (s === "failed") {
-      setStatus(statusEl, "Connection failed – same Wi-Fi? Client isolation off?", "error");
-      scheduleRetry(1_000, "Connection failed");
-    } else if (s === "disconnected") {
-      setStatus(statusEl, "Connection dropped…", "warn");
-      scheduleRetry(DISCONNECT_GRACE_MS, "Connection dropped");
-    } else {
-      setStatus(statusEl, `WebRTC: ${s}`, "warn");
+      showSource("direct");
+      setStatus(statusEl, "Live from phone ✓ (direct)", "ok");
+      return;
     }
+    if (s === "failed") scheduleRetry(1_000, "Connection failed");
+    else if (s === "disconnected") scheduleRetry(DISCONNECT_GRACE_MS, "Connection dropped");
+
+    if (!relayCanvas.hidden) setStatus(statusEl, "Live from phone ✓ (via server relay)", "ok");
+    else if (s === "failed") setStatus(statusEl, "Direct link failed – waiting for relay frames…", "warn");
+    else setStatus(statusEl, `WebRTC: ${s}`, "warn");
   };
   scheduleRetry(CONNECT_TIMEOUT_MS, "Connection timed out");
   await peer.setRemoteDescription(offer);
@@ -103,12 +103,67 @@ function closePeer() {
   pc?.close();
   pc = null;
   video.srcObject = null;
-  placeholder.hidden = false;
+  showSource(relayFresh() ? "relay" : "none");
 }
+
+// ------------------------------------------------------ relay fallback
+// When the direct WebRTC link can't connect, the phone sends JPEG frames through
+// the server instead; they're drawn here until the direct video takes over.
+const relayCtx = relayCanvas.getContext("2d");
+const RELAY_STALE_MS = 3000;
+let lastRelayAt = 0;
+let relayFrames = 0;
+
+const directLive = () => pc?.connectionState === "connected" && video.videoWidth > 0;
+const relayFresh = () => Date.now() - lastRelayAt < RELAY_STALE_MS;
+
+function showSource(source) {
+  video.hidden = source === "relay";
+  relayCanvas.hidden = source !== "relay";
+  placeholder.hidden = source !== "none";
+}
+
+function openRelay() {
+  const ws = new WebSocket(wsUrl(`/ws/relay/${encodeURIComponent(room)}?role=viewer`));
+  ws.binaryType = "blob";
+  ws.onmessage = async (e) => {
+    if (directLive()) return;
+    const bitmap = await createImageBitmap(e.data);
+    relayCanvas.width = bitmap.width;
+    relayCanvas.height = bitmap.height;
+    relayCtx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    lastRelayAt = Date.now();
+    relayFrames++;
+    if (relayCanvas.hidden) {
+      showSource("relay");
+      setStatus(statusEl, "Live from phone ✓ (via server relay)", "ok");
+    }
+  };
+  ws.onclose = () => setTimeout(openRelay, 1500);
+}
+openRelay();
+
+setInterval(() => {
+  if (relayCanvas.hidden) return;
+  if (directLive()) {
+    showSource("direct");
+    setStatus(statusEl, "Live from phone ✓ (direct)", "ok");
+  } else if (!relayFresh()) {
+    showSource("none");
+    setStatus(statusEl, "Phone stopped sending video. Waiting…", "warn");
+  }
+}, 1000);
 
 // Receive stats: resolution, fps, bitrate.
 let lastBytes = 0, lastTs = 0;
 setInterval(async () => {
+  if (!relayCanvas.hidden) {
+    statsEl.textContent = `${relayCanvas.width}×${relayCanvas.height} · ${relayFrames} fps · server relay`;
+    relayFrames = 0;
+    return;
+  }
+  relayFrames = 0;
   if (!pc) { statsEl.textContent = ""; return; }
   const report = await pc.getStats();
   report.forEach((s) => {
@@ -149,14 +204,16 @@ function openFrameSocket() {
 }
 
 function grabFrame() {
+  const useRelay = !relayCanvas.hidden;
+  const [w, h] = useRelay ? [relayCanvas.width, relayCanvas.height] : [video.videoWidth, video.videoHeight];
   // Skip if no video yet, or the previous frame hasn't been acknowledged (back-pressure).
-  if (inFlight || !video.videoWidth || frameWs?.readyState !== WebSocket.OPEN) return;
+  if (inFlight || !w || frameWs?.readyState !== WebSocket.OPEN) return;
   // Downscale here (the server would anyway) so encoding stays cheap and never
   // steals time from video playback.
-  const scale = Math.min(1, MAX_CAPTURE_SIDE / Math.max(video.videoWidth, video.videoHeight));
-  canvas.width = Math.round(video.videoWidth * scale);
-  canvas.height = Math.round(video.videoHeight * scale);
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const scale = Math.min(1, MAX_CAPTURE_SIDE / Math.max(w, h));
+  canvas.width = Math.round(w * scale);
+  canvas.height = Math.round(h * scale);
+  ctx.drawImage(useRelay ? relayCanvas : video, 0, 0, canvas.width, canvas.height);
   inFlight = true;
   canvas.toBlob(async (blob) => {
     if (blob && frameWs.readyState === WebSocket.OPEN) frameWs.send(await blob.arrayBuffer());

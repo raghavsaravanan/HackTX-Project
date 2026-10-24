@@ -34,7 +34,8 @@ code { background: var(--panel); padding: 1px 6px; border-radius: 4px; }
 .status[data-state="error"]::before { color: var(--error); }
 
 .video-wrap { position: relative; background: #000; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); aspect-ratio: 16 / 9; }
-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+video, .video-wrap canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+video[hidden], .video-wrap canvas[hidden] { display: none; }
 video.mirrored { transform: scaleX(-1); }
 
 .placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 12px; padding: 16px; background: var(--panel); }

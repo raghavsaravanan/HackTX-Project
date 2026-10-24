@@ -186,6 +186,7 @@ datasets or offline batch inference).
 app/
   main.py        FastAPI routes: pages, signaling + frame WebSockets, frame/analyze API
   signaling.py   Room-based offer/answer/ICE relay (one phone + one viewer per room)
+  relay.py       Fallback video: phone JPEG frames forwarded to viewers over WebSocket
   frames.py      Frame ring buffer and Llama-oriented preprocessing
   llama.py       OpenAI-compatible client for a Llama vision model
   network.py     LAN IP detection and self-signed certificate generation
@@ -212,7 +213,10 @@ run.py           Starts uvicorn with HTTPS and prints the URLs + QR code
   generate `certs/cert.pem`/`certs/key.pem` with it, and trust its root CA on the phone to
   get rid of the warning.)
 * **Stuck on "WebRTC: connecting" / "failed"** – both devices must be on the same Wi-Fi
-  without client isolation, and VPNs on either device should be off.
+  without client isolation, and VPNs on either device should be off. While the direct link
+  is down, the phone falls back to sending ~8 fps JPEG frames through the server
+  (`/ws/relay/{room}`), and the status shows "via server relay". Open the phone page with
+  `?mode=relay` to skip WebRTC entirely on networks that block device-to-device traffic.
 * **Black video on iPhone after locking the screen** – iOS pauses the camera in background
   tabs; unlock and tap *Restart camera*.
 * **`/api/analyze` returns 502** – the Llama backend isn't reachable; check `ollama serve` is

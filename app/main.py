@@ -19,6 +19,7 @@ from .config import ROOT_DIR, settings
 from .frames import FrameBuffer
 from .llama import DEFAULT_SYSTEM_PROMPT, LlamaError, LlamaVisionClient
 from .network import lan_ip
+from .relay import FrameRelay
 from .signaling import ROLES, SignalingHub
 
 log = logging.getLogger("phonecam")
@@ -28,6 +29,7 @@ app = FastAPI(title="Phone Camera -> MacBook (WebRTC)")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 hub = SignalingHub()
+relay_hub = FrameRelay()
 frames = FrameBuffer(
     maxlen=settings.frame_buffer_size,
     max_side=settings.frame_max_side,
@@ -144,6 +146,30 @@ async def signal(ws: WebSocket, room: str, role: str = Query(...)) -> None:
         pass
     finally:
         await hub.leave(room, role, ws)
+
+
+@app.websocket("/ws/relay/{room}")
+async def relay(ws: WebSocket, room: str, role: str = Query(...)) -> None:
+    """Fallback video: the phone (sender) pushes JPEG frames, viewers receive them."""
+    if role not in ROLES:
+        await ws.close(code=4001, reason=f"role must be one of {ROLES}")
+        return
+    await ws.accept()
+    if role == "viewer":
+        relay_hub.add_viewer(room, ws)
+        try:
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            relay_hub.remove_viewer(room, ws)
+        return
+    try:
+        while True:
+            relay_hub.publish(room, await ws.receive_bytes())
+    except WebSocketDisconnect:
+        pass
 
 
 @app.websocket("/ws/frames")
