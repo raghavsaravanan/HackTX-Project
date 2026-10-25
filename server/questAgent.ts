@@ -32,7 +32,7 @@ type PlannedQuest = Omit<Quest, "id" | "steps" | "goalCheck"> & { goal_check: st
  * Plans a quest by reasoning about the goal and (when the camera is on) the surveyed room.
  * `context` describes the situation when re-planning mid-quest. Never falls back to a scripted quest.
  */
-export async function planQuest(goal: string, scene: Scene | null, context = ""): Promise<Quest> {
+export async function planQuest(goal: string, scene: Scene | null, context = "", attempt = 1): Promise<Quest> {
   if (questMode() === "mock") throw new Error("Quest planning needs GEMINI_API_KEY or MODEL_API_KEY");
   const { value: planned } = await agentJson<PlannedQuest>({
     system: QUEST_AGENT_SYSTEM,
@@ -41,6 +41,8 @@ export async function planQuest(goal: string, scene: Scene | null, context = "")
     name: "quest",
     timeoutMs: 30000,
     planning: true,
+    operation: "plan",
+    attempt: attempt > 1 ? attempt : undefined,
   });
   console.log(`[plan] "${goal.slice(0, 60)}" -> ${planned.steps.length} steps. Reasoning: ${(planned.analysis ?? "").slice(0, 300)}`);
   const { goal_check, ...rest } = planned;
@@ -52,10 +54,10 @@ export async function planQuest(goal: string, scene: Scene | null, context = "")
   };
 }
 
-async function speak(label: string, prompt: string, fallback: string): Promise<Line> {
+async function speak(label: "narrate" | "hint", prompt: string, fallback: string): Promise<Line> {
   if (questMode() === "mock") return { text: fallback, source: "system" };
   try {
-    const { value, source } = await agentText({ system: QUEST_AGENT_SYSTEM, prompt });
+    const { value, source } = await agentText({ system: QUEST_AGENT_SYSTEM, prompt, operation: label });
     return { text: value, source };
   } catch (err) {
     console.warn(`[${label}]`, redact((err as Error).message).slice(0, 160));
@@ -119,6 +121,7 @@ async function turn(prompt: string, fallback: () => Omit<AgentTurn, "source">): 
       schema: AGENT_TURN_SCHEMA,
       name: "agent_turn",
       timeoutMs: 12000,
+      operation: "agent_turn",
     });
     return {
       reply: raw.reply?.trim() ?? "",
@@ -188,6 +191,7 @@ export async function understand(state: AgentState, utterance: string, wakeHeard
       name: "interpretation",
       timeoutMs: 5000,
       fast: true,
+      operation: "interpret",
     });
     return { addressed: value.addressed_to_agent === true, kind: value.kind, goal: value.goal?.trim() ?? "", command: value.command ?? "none" };
   } catch (err) {

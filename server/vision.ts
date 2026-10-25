@@ -1,5 +1,5 @@
 // The Vision Agent: everything that looks at camera frames. OpenAI or Gemini first, Muse Spark vision as fallback.
-import type { QuestStep, Scene, SceneObject, StepObservation, Verdict, VisionCheck, VisionTiming } from "../shared/types.ts";
+import type { ApiOperation, QuestStep, Scene, SceneObject, StepObservation, Verdict, VisionCheck, VisionTiming } from "../shared/types.ts";
 import { config, hasMuse, redact, visionMode } from "./config.ts";
 import { MOCK_SCENE, mockObservation } from "./mock.ts";
 import {
@@ -15,6 +15,7 @@ import {
 import { geminiCoolingDown, geminiJson } from "./providers/gemini.ts";
 import { museImageMessage, museJson } from "./providers/muse.ts";
 import { openaiJson } from "./providers/openai.ts";
+import { shortError, trackApiCall } from "./telemetry.ts";
 import { boxFrom1000, clamp, timed } from "./util.ts";
 
 interface RawObservation {
@@ -93,6 +94,17 @@ function scheduleVision<T>(
   return runBackground(fn);
 }
 
+const VISION_OPERATION: Record<string, ApiOperation> = { vision_check: "vision_check", step_observation: "step_observation", scene: "scene_survey" };
+
+/** A short, payload-free description of a vision result for the workflow view. */
+function summarizeVision(value: unknown): string {
+  const v = value as Partial<RawVerdict & RawObservation & RawScene>;
+  if (v.verdict) return `${v.verdict}, ${Math.round((Number(v.confidence) || 0) * 100)}% confident`;
+  if (Array.isArray(v.objects)) return `${v.objects.length} objects, ${v.hazards?.length ?? 0} hazards`;
+  if (typeof v.target_visible === "boolean") return `Target ${v.target_visible ? `in view, ${String(v.distance).replace("_", " ")}` : "not in view"}`;
+  return "Structured result";
+}
+
 /** Gemini first; on failure (quota, timeout) fall back to Muse Spark vision when a Meta key is present. */
 function visionJson<T>(prompt: string, image: string, schema: object, name: string, lane: VisionLane, system = VISION_SYSTEM) {
   const work = () => visionJsonNow<T>(prompt, image, schema, name, system);
@@ -106,44 +118,60 @@ async function visionJsonNow<T>(
   name: string,
   system = VISION_SYSTEM,
 ): Promise<{ value: T; provider: VisionProvider }> {
-  const viaMuse = async () => ({
-    value: await museJson<T>({
-      messages: [{ role: "developer", content: system }, museImageMessage(prompt, image)],
-      schema: { name, schema },
-    }),
+  const operation = VISION_OPERATION[name] ?? "step_observation";
+  const viaMuse = async (fallbackFrom?: "gemini" | "openai", fallbackReason?: string) => ({
+    value: await trackApiCall(
+      { provider: "muse", model: config.muse.model, operation, fallbackFrom, fallbackReason },
+      () =>
+        museJson<T>({
+          messages: [{ role: "developer", content: system }, museImageMessage(prompt, image)],
+          schema: { name, schema },
+        }),
+      summarizeVision,
+    ),
     provider: "muse" as const,
   });
   if (visionMode() === "openai") {
     try {
       return {
-        value: await openaiJson<T>({
-          system,
-          prompt,
-          image,
-          schema,
-          name,
-          model: config.openai.visionModel,
-          apiKey: config.openai.visionApiKey,
-          reasoningEffort: config.openai.reasoningEffort,
-        }),
+        value: await trackApiCall(
+          { provider: "openai", model: config.openai.visionModel, operation },
+          () =>
+            openaiJson<T>({
+              system,
+              prompt,
+              image,
+              schema,
+              name,
+              model: config.openai.visionModel,
+              apiKey: config.openai.visionApiKey,
+              reasoningEffort: config.openai.reasoningEffort,
+            }),
+          summarizeVision,
+        ),
         provider: "openai",
       };
     } catch (err) {
       if (!hasMuse()) throw err;
       console.warn("[vision] OpenAI failed, using Muse Spark:", redact((err as Error).message).slice(0, 120));
-      return viaMuse();
+      return viaMuse("openai", shortError(err));
     }
   }
-  if (visionMode() !== "gemini" || geminiCoolingDown()) return viaMuse();
+  if (visionMode() !== "gemini") return viaMuse();
+  if (geminiCoolingDown()) return viaMuse("gemini", "Gemini is cooling down after a quota limit");
   try {
     return {
-      value: await geminiJson<T>({ system, prompt, image, schema, model: config.gemini.visionModel, apiKey: config.gemini.visionApiKey }),
+      value: await trackApiCall(
+        { provider: "gemini", model: config.gemini.visionModel, operation },
+        () => geminiJson<T>({ system, prompt, image, schema, model: config.gemini.visionModel, apiKey: config.gemini.visionApiKey }),
+        summarizeVision,
+      ),
       provider: "gemini",
     };
   } catch (err) {
     if (!hasMuse()) throw err;
     console.warn("[vision] Gemini failed, using Muse Spark:", redact((err as Error).message).slice(0, 120));
-    return viaMuse();
+    return viaMuse("gemini", shortError(err));
   }
 }
 

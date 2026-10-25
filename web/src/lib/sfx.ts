@@ -42,7 +42,7 @@ export function playNotes(notes: Note[], destination?: AudioNode) {
 }
 
 const hz = (semitonesFromA4: number) => 440 * 2 ** (semitonesFromA4 / 12);
-const C5 = hz(3), E5 = hz(7), G5 = hz(10), C6 = hz(15), E6 = hz(19), G6 = hz(22);
+const C5 = hz(3), E5 = hz(7), G5 = hz(10), C6 = hz(15);
 
 const SOUNDS: Record<Sfx, Note[]> = {
   start: [
@@ -54,11 +54,6 @@ const SOUNDS: Record<Sfx, Note[]> = {
     { freq: E5, at: 0.08, dur: 0.18 },
     { freq: G5, at: 0.16, dur: 0.35 },
   ],
-  combo: [
-    { freq: E6, at: 0.3, dur: 0.12, type: "sine", gain: 0.12 },
-    { freq: G6, at: 0.38, dur: 0.12, type: "sine", gain: 0.12 },
-    { freq: hz(27), at: 0.46, dur: 0.3, type: "sine", gain: 0.12 },
-  ],
   quest: [
     { freq: G5 / 2, at: 0, dur: 0.2, type: "square", gain: 0.07 },
     { freq: C5, at: 0.18, dur: 0.2, type: "square", gain: 0.07 },
@@ -67,7 +62,6 @@ const SOUNDS: Record<Sfx, Note[]> = {
     { freq: C6, at: 0.95, dur: 0.9, type: "triangle", gain: 0.16 },
     { freq: E5, at: 0.95, dur: 0.9, type: "triangle", gain: 0.1 },
   ],
-  levelup: [0, 4, 7, 12, 16, 19, 24].map((s, i) => ({ freq: hz(3 + s), at: 0.9 + i * 0.07, dur: 0.4, type: "sine" as const, gain: 0.11 })),
   fail: [
     { freq: hz(-5), at: 0, dur: 0.25, type: "sawtooth", gain: 0.07 },
     { freq: hz(-9), at: 0.2, dur: 0.4, type: "sawtooth", gain: 0.07 },

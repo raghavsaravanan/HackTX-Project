@@ -1,8 +1,4 @@
-// Shared helpers for the phone (sender) and laptop (viewer) pages.
-
-// Same Wi-Fi network: host ICE candidates are enough, so no STUN/TURN servers
-// are configured and no traffic leaves the LAN.
-export const RTC_CONFIG = { iceServers: [] };
+// Shared helpers for the phone controller.
 
 export function roomFromUrl() {
   return new URLSearchParams(location.search).get("room") || "default";

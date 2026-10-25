@@ -64,8 +64,8 @@ export const config = {
      */
     onlyTo: env.SHARE_ONLY_TO?.trim() ?? "",
   },
-  visionProvider: (env.VISION_PROVIDER ?? "gemini") as Provider,
-  questProvider: (env.QUEST_AGENT_PROVIDER ?? "gemini") as Provider,
+  visionProvider: (env.VISION_PROVIDER || "muse") as Provider,
+  questProvider: (env.QUEST_AGENT_PROVIDER || "muse") as Provider,
   cameraLink: {
     /** The Python phone camera app's local HTTP port. Empty disables it. */
     url: (env.CAMERA_LINK_URL ?? "http://127.0.0.1:8000").replace(/\/$/, ""),

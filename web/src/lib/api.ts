@@ -1,4 +1,4 @@
-import type { AskResponse, ServerEvent, SessionSnapshot, VisionCheck } from "../../../shared/types.ts";
+import type { AskResponse, ServerEvent, SessionSnapshot, VisionCheck, VoiceResponse } from "../../../shared/types.ts";
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -19,8 +19,10 @@ export interface Health {
   quest: string;
   gemini: boolean;
   verifySteps: boolean;
+  cadence?: { frameMs: number; frameMaxSide: number; surveyMs: number; hintAfterSec: number };
   visionNote?: string;
-  visionQueue?: { interactive: number; background: number };
+  visionQueue?: { busy: boolean; interactiveQueued: number; running: number };
+  geminiStatus?: { coolingDown: boolean; quotaExhausted: boolean; until: number | null };
   cameraLink: { url: string; reachable: boolean; lastFrameAgeMs: number | null } | null;
 }
 
@@ -36,10 +38,20 @@ const getJson = <T,>(url: string) =>
     return r.json() as Promise<T>;
   });
 
+export interface Preset {
+  id: string;
+  title: string;
+  steps: number;
+}
+
 export const api = {
   health: () => getJson<Health>("/api/health"),
   cameraInfo: () => getJson<CameraInfo>("/api/info"),
+  presets: () => getJson<Preset[]>("/api/presets"),
   ask: (sessionId: string, text: string) => post<AskResponse>("/api/agent/ask", { sessionId, text }),
+  /** Typed words, handled like speech after the wake phrase: a new task, a question, or a command. */
+  say: (sessionId: string, text: string) => post<VoiceResponse>("/api/say", { sessionId, text }),
+  startTask: (sessionId: string, task: { goal: string } | { presetId: string }) => post<SessionSnapshot>("/api/quest/start", { sessionId, ...task }),
   verifyMission: (sessionId: string, stepId: string) =>
     post<{ check: VisionCheck; snapshot: SessionSnapshot }>("/api/mission/verify", { sessionId, stepId }),
 };
@@ -55,4 +67,4 @@ export function sessionIdFromUrl(): string {
   return new URLSearchParams(location.search).get("session") ?? "demo";
 }
 
-export const SOURCE_LABEL: Record<string, string> = { gemini: "Gemini Quest Agent", muse: "Muse Spark", system: "system" };
+export const SOURCE_LABEL: Record<string, string> = { gemini: "Gemini Quest Agent", openai: "OpenAI Quest Agent", muse: "Muse Spark", system: "Template" };

@@ -66,14 +66,10 @@ def test_signaling_replaces_viewer_mdns_hosts_with_lan_ip(monkeypatch):
             assert "192.168.1.50 9 typ host" in sender.receive_json()["sdp"]["sdp"]
 
 
-def test_relay_forwards_phone_frames_to_viewer():
-    frame = _jpeg(64, 48)
-    # One shared event loop: the relay sends to the viewer from the phone's handler task.
-    with TestClient(app) as client:
-        with client.websocket_connect("/ws/relay/r1?role=viewer") as viewer:
-            with client.websocket_connect("/ws/relay/r1?role=sender") as phone:
-                phone.send_bytes(frame)
-                assert viewer.receive_bytes() == frame
+def test_root_redirects_to_phone_and_viewer_is_gone():
+    client = TestClient(app)
+    assert client.get("/", follow_redirects=False).headers["location"] == "/phone"
+    assert client.get("/viewer").status_code == 404
 
 
 def test_frame_ingest_and_latest_endpoint():

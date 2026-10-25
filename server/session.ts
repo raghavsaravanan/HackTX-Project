@@ -6,7 +6,6 @@ import type {
   LineSource,
   MissionState,
   PipelineStage,
-  PlayerStats,
   Quest,
   QuestMap,
   QuestStep,
@@ -23,7 +22,6 @@ import type {
 } from "../shared/types.ts";
 import { fetchCameraFrame } from "./cameraLink.ts";
 import { config, questMode, redact, visionMode } from "./config.ts";
-import { freshStats, rewardQuest, rewardStep } from "./game.ts";
 import { computeGuidance, type SeenAt } from "./guidance.ts";
 import { anchorLabel, applyNotes, buildMap, findLandmark, markSeen, mergeScene, setPlayerAt } from "./map.ts";
 import { NARRATOR } from "./prompts.ts";
@@ -45,6 +43,7 @@ import {
 import { cloudVoiceEnabled, registerSpeakLine } from "./tts.ts";
 import { messagesAvailable } from "./providers/messages.ts";
 import { SHARE_QUESTION, handleShareReply, shareConsumes, shareOffer } from "./share.ts";
+import { onApiCall, recentApiCalls } from "./telemetry.ts";
 import { timed, uid } from "./util.ts";
 import { inspect, observeStep, scanScene } from "./vision.ts";
 import { matchWake, wakePhrase } from "./wake.ts";
@@ -59,7 +58,6 @@ interface Session {
   stepStartedAt: number | null;
   questStartedAt: number | null;
   questEndedAt: number | null;
-  stats: PlayerStats;
   lastSay: string;
   lastSayAt: number;
   lastTranscript: string;
@@ -129,7 +127,6 @@ export function getSession(id: string): Session {
       stepStartedAt: null,
       questStartedAt: null,
       questEndedAt: null,
-      stats: freshStats(),
       lastSay: "",
       lastSayAt: 0,
       lastTranscript: "",
@@ -173,13 +170,13 @@ export function snapshot(s: Session): SessionSnapshot {
     stepStartedAt: s.stepStartedAt,
     questStartedAt: s.questStartedAt,
     questEndedAt: s.questEndedAt,
-    stats: s.stats,
     narratorName: NARRATOR.name,
     wakePhrase: wakePhrase(),
     cloudVoice: cloudVoiceEnabled(),
     lastTranscript: s.lastTranscript,
     missions: s.missions,
     map: s.map,
+    scene: s.scene,
     savedQuests: s.saved.map(summarizeSaved),
     share: s.share,
   };
@@ -223,6 +220,7 @@ export function subscribe(s: Session, res: Response, role: Role) {
   const sub = { res, role, clientId: uid("ph") };
   s.subscribers.add(sub);
   write(res, { type: "snapshot", snapshot: snapshot(s) });
+  if (role === "stage") for (const call of recentApiCalls()) write(res, { type: "api_call", call });
   if (role === "phone") {
     // The newest phone page takes over speaking and listening (e.g. after rescanning the QR code).
     write(res, { type: "hello", clientId: sub.clientId });
@@ -251,6 +249,11 @@ function broadcast(s: Session, event: ServerEvent, only?: Role) {
 }
 
 const pushSnapshot = (s: Session) => broadcast(s, { type: "snapshot", snapshot: snapshot(s) });
+
+// API calls are made by the one game server on behalf of every session, so every hub sees them.
+onApiCall((call) => {
+  for (const s of sessions.values()) broadcast(s, { type: "api_call", call }, "stage");
+});
 
 function say(s: Session, text: string, source: LineSource, sfx?: Sfx[], priority = false) {
   s.lastSay = text;
@@ -370,7 +373,6 @@ export function startQuest(s: Session, quest: Quest, source: LineSource, scene: 
   s.questStartedAt = Date.now();
   s.questEndedAt = null;
   s.hintsThisQuest = 0;
-  s.stats = { ...s.stats, combo: 0 };
   s.map = buildMap(quest, s.scene);
   s.missions = quest.steps.map((step, i) => ({
     stepId: step.id,
@@ -486,7 +488,7 @@ function planningFailed(s: Session, message: string) {
 async function planWithRetry(s: Session, goal: string, scene: Scene | null): Promise<Quest> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await planQuest(goal, scene);
+      return await planQuest(goal, scene, "", attempt);
     } catch (err) {
       const message = (err as Error).message;
       if (attempt >= 3 || !isNetworkError(message)) throw err;
@@ -505,38 +507,31 @@ export function recordTranscript(s: Session, text: string) {
 function completeStep(s: Session, check: VisionCheck | null = null) {
   const quest = s.quest!;
   const step = currentStep(s)!;
-  const { stats, reward } = rewardStep(s.stats, {
-    usedHint: s.hintsThisStep > 0,
-    durationMs: Date.now() - (s.stepStartedAt ?? Date.now()),
-  });
-  s.stats = stats;
   setMission(s, s.stepIndex, { status: "done", ...(check ? { lastCheck: check } : {}) });
   setPlayerAt(s.map, anchorLabel(step));
-  broadcast(s, { type: "reward", stepId: step.id, reward });
+  broadcast(s, { type: "progress", stepId: step.id, label: step.summary || `${step.action} ${step.target}`, sfx: ["step"] });
 
   s.stepIndex++;
   const next = currentStep(s);
   if (!next) {
     pushSnapshot(s);
     void confirmGoal(s, quest);
-    return reward;
+    return;
   }
   setMission(s, s.stepIndex, { status: "active" });
   resetStepState(s);
   pushSnapshot(s);
 
-  const comboNote = reward.combo >= 3 ? ` The player is on a ${reward.combo}-step combo.` : "";
   const evidence = check?.evidence.length ? ` The Vision Agent confirmed it: ${check.evidence.join("; ")}.` : "";
   void narrateTracked(
     s,
     "STEP_COMPLETE",
-    `Quest: ${quest.title}. The player just finished: ${step.action} the ${step.target}.${evidence}${comboNote} ` +
-      `Briefly celebrate, then give this next instruction in your voice: "${next.instruction}"`,
-    `Well done! ${next.instruction}`,
+    `Task: ${quest.title}. The player just finished: ${step.action} the ${step.target}.${evidence} ` +
+      `Acknowledge it in a few words, then give this next instruction in your voice: "${next.instruction}"`,
+    `That's done. ${next.instruction}`,
   ).then((line) => {
     if (currentStep(s)?.id === next.id) say(s, line.text, line.source);
   });
-  return reward;
 }
 
 const MAX_FOLLOW_UPS = 2;
@@ -629,27 +624,26 @@ async function revisePlan(s: Session, quest: Quest, change: string, opener: stri
 
 function finishQuest(s: Session, quest: Quest, inspected = false, saidDone = false) {
   const durationMs = Date.now() - (s.questStartedAt ?? Date.now());
-  const { stats, reward } = rewardQuest(s.stats, { type: quest.type, hintsUsed: s.hintsThisQuest });
-  s.stats = stats;
   s.status = "complete";
   s.stepStartedAt = null;
   s.questEndedAt = Date.now();
-  broadcast(s, { type: "reward", stepId: "quest", reward });
+  broadcast(s, { type: "progress", stepId: "quest", label: quest.title, sfx: ["quest"] });
   pushSnapshot(s);
 
+  const stepsDone = s.missions.filter((m) => m.status === "done").length;
   const seconds = Math.round(durationMs / 1000);
   void narrateTracked(
     s,
     "QUEST_COMPLETE",
     saidDone
-      ? `The player just told you they finished "${quest.title}" (goal: ${s.goal || quest.title}), earning ${reward.xpGained} XP and reaching level ${stats.level}. ` +
-          "Congratulate them warmly in two sentences on getting it done. Don't mention step counts or how long it took."
-      : `The player completed "${quest.title}" (${quest.steps.length} steps) in ${seconds} seconds using ${s.hintsThisQuest} hints, ` +
-          `earning ${reward.xpGained} XP and reaching level ${stats.level}. Give a triumphant two-sentence recap of their deeds.`,
-    `Quest complete! ${quest.title} is conquered in ${seconds} ${seconds === 1 ? "second" : "seconds"}. You are now level ${stats.level}.`,
+      ? `The player just told you they finished "${quest.title}" (goal: ${s.goal || quest.title}). ` +
+          "Acknowledge it warmly in two sentences. Don't mention step counts or how long it took."
+      : `The player completed "${quest.title}" (${quest.steps.length} steps) in ${seconds} seconds. ` +
+          "Give a calm two-sentence recap of what they got done.",
+    `That's everything for ${quest.title}. Nicely done.`,
   ).then((line) => {
     say(s, line.text, line.source, undefined, true);
-    broadcast(s, { type: "quest_complete", questId: quest.id, title: quest.title, recap: line.text, durationMs, stats: s.stats });
+    broadcast(s, { type: "quest_complete", questId: quest.id, title: quest.title, recap: line.text, durationMs, stepsDone, stepsTotal: quest.steps.length });
     if (!inspected) void finalInspection(s, quest);
     if (messagesAvailable()) {
       // Celebrate, then offer to share it. Paused quests wait until the share is done.
@@ -784,7 +778,7 @@ async function runCheck(s: Session, question: string, image: string | null, cont
 
 const shouldVerify = () => config.game.verifySteps && visionMode() !== "mock";
 
-/** The frame loop thinks the step is done; the Vision Agent must agree before XP is awarded. */
+/** The frame loop thinks the step is done; the Vision Agent must agree before the step counts. */
 async function verifyStep(s: Session, step: QuestStep, image: string) {
   const index = s.stepIndex;
   s.verifying = true;
@@ -1229,7 +1223,8 @@ export async function surveySurroundings(only?: Session) {
     for (const s of fresh) {
       if (frame) s.surveyFrameId = frame.frameId;
       s.scene = scene;
-      if (mergeScene(s.map, scene)) pushSnapshot(s);
+      mergeScene(s.map, scene);
+      pushSnapshot(s);
     }
   } catch (err) {
     console.warn("[survey]", redact((err as Error).message).slice(0, 160));
@@ -1248,7 +1243,6 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
     case "skip": {
       const step = currentStep(s);
       if (!step || s.status !== "active") return;
-      s.stats = { ...s.stats, combo: 0 };
       setMission(s, s.stepIndex, { status: "skipped" });
       s.stepIndex++;
       const next = currentStep(s);
@@ -1300,7 +1294,6 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
       s.quest = null;
       s.stepIndex = 0;
       s.stepStartedAt = null;
-      s.stats = freshStats();
       s.lastTranscript = "";
       s.saved = [];
       s.planToken++;
@@ -1315,13 +1308,22 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
         return;
       }
       trackPipeline(s, "vision", "start");
-      const scanned = await scanScene(frame, "interactive");
+      let scanned: Awaited<ReturnType<typeof scanScene>> = null;
+      try {
+        scanned = await scanScene(frame, "interactive");
+      } catch (err) {
+        console.warn("[describe]", redact((err as Error).message).slice(0, 160));
+      }
       if (!scanned) {
+        trackPipeline(s, "vision", "error", undefined, "survey failed");
         say(s, "Give me a second and try again.", "system", undefined, true);
         return;
       }
       const { scene, timing } = scanned;
       trackPipeline(s, "vision", "done", timing.ms, `${scene.objects.length} objects`);
+      s.scene = scene;
+      mergeScene(s.map, scene);
+      pushSnapshot(s);
       const line = await describeScene(scene);
       say(s, line.text, line.source, undefined, true);
       return;

@@ -22,6 +22,7 @@ import {
   trackPipeline,
   verifyMission,
 } from "./session.ts";
+import { trackApiCall } from "./telemetry.ts";
 import { errorDetail, timed, uid } from "./util.ts";
 
 const app = express();
@@ -53,6 +54,12 @@ app.get(
           : null,
       visionQueue: visionQueueStatus(),
       verifySteps: config.game.verifySteps,
+      cadence: {
+        frameMs: config.cameraLink.intervalMs,
+        frameMaxSide: config.cameraLink.maxSide,
+        surveyMs: config.surveyIntervalMs,
+        hintAfterSec: config.game.hintAfterSec,
+      },
       cameraLink: cameraLinkEnabled() ? await cameraLinkStatus() : null,
     });
   }),
@@ -140,7 +147,13 @@ async function transcribe(s: ReturnType<typeof getSession>, wav: Buffer): Promis
   // Voice gets the uplink first: frame and survey uploads wait until the audio is transcribed.
   const release = holdVision();
   try {
-    const { value: transcript, ms } = await timed(() => museTranscribe(wav, keywords));
+    const { value: transcript, ms } = await timed(() =>
+      trackApiCall(
+        { provider: "muse", model: config.muse.transcribeModel, operation: "transcribe" },
+        () => museTranscribe(wav, keywords),
+        (text) => `${text.split(/\s+/).filter(Boolean).length} words`,
+      ),
+    );
     trackPipeline(s, "transcribe", "done", ms);
     return transcript;
   } catch (err) {

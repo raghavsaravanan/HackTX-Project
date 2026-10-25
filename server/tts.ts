@@ -1,5 +1,6 @@
 import { config } from "./config.ts";
 import { elevenLabsSpeak } from "./providers/elevenlabs.ts";
+import { trackApiCall } from "./telemetry.ts";
 import { uid } from "./util.ts";
 
 const lines = new Map<string, string>();
@@ -29,7 +30,11 @@ export async function speakLineAudio(id: string): Promise<Buffer | null> {
   if (cached) return cached;
   const text = lines.get(id);
   if (!text || !config.elevenlabs.apiKey) return null;
-  const audio = await elevenLabsSpeak(text);
+  const audio = await trackApiCall(
+    { provider: "elevenlabs", model: config.elevenlabs.model, operation: "speech" },
+    () => elevenLabsSpeak(text),
+    (buf) => `${Math.round(buf.length / 1024)} KB of audio for ${text.length} characters`,
+  );
   audioCache.set(id, audio);
   while (audioCache.size > MAX_CACHE) {
     const oldest = audioCache.keys().next().value;

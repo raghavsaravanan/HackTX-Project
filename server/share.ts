@@ -270,6 +270,7 @@ async function composeMessage(task: ShareState["task"], contactName: string): Pr
         "Reply with only the message text, no quotes.",
       ].join("\n"),
       timeoutMs: 8000,
+      operation: "share_message",
     });
     const text = value.trim().replace(/^["“]|["”]$/g, "");
     return text && text.length <= 320 ? text : fallback;

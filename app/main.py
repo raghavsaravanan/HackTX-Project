@@ -1,6 +1,6 @@
-"""FastAPI camera server: serves the phone controller and the live viewer, relays WebRTC
-signaling, buffers the phone's frames for the game's Vision Agent, and proxies the phone's
-voice and narration to the game API."""
+"""FastAPI camera server: serves the phone controller, tracks which phone is connected,
+buffers the phone's frames for the game's Vision Agent, and proxies the phone's voice and
+narration to the game API."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from pydantic import BaseModel, Field
 from .config import ROOT_DIR, settings
 from .frames import FrameBuffer, prepare_image
 from .network import lan_ip
-from .relay import FrameRelay
 from .signaling import ROLES, SignalingHub
 
 log = logging.getLogger("phonecam")
@@ -41,7 +40,6 @@ async def revalidate_static(request: Request, call_next):
     return response
 
 hub = SignalingHub()
-relay_hub = FrameRelay()
 frames = FrameBuffer(
     maxlen=settings.frame_buffer_size,
     max_side=settings.frame_max_side,
@@ -58,17 +56,12 @@ def phone_url(room: str = "default") -> str:
 # --------------------------------------------------------------------- pages
 @app.get("/", include_in_schema=False)
 async def index() -> RedirectResponse:
-    return RedirectResponse("/viewer")
+    return RedirectResponse("/phone")
 
 
 @app.get("/phone", include_in_schema=False)
 async def phone_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "phone.html")
-
-
-@app.get("/viewer", include_in_schema=False)
-async def viewer_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "viewer.html")
 
 
 # ----------------------------------------------------------------------- api
@@ -204,7 +197,7 @@ async def game_text(body: GameText, session: str | None = None) -> Response:
 
 @app.get("/api/game/events")
 async def game_events(session: str | None = None) -> StreamingResponse:
-    """The game's server-sent events (narration, rewards, verdicts) for the phone to speak aloud."""
+    """The game's server-sent events (narration, progress, verdicts) for the phone to speak aloud."""
     url = f"{settings.sidequest_api_url}/api/session/{_game_session(session)}/events"
     client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=None))
     try:
@@ -242,32 +235,6 @@ async def signal(ws: WebSocket, room: str, role: str = Query(...)) -> None:
         pass
     finally:
         await hub.leave(room, role, ws)
-
-
-@app.websocket("/ws/relay/{room}")
-async def relay(ws: WebSocket, room: str, role: str = Query(...)) -> None:
-    """Fallback video: the phone (sender) pushes JPEG frames, viewers receive them."""
-    if role not in ROLES:
-        await ws.close(code=4001, reason=f"role must be one of {ROLES}")
-        return
-    if role == "viewer":
-        # Register before accepting so a frame published right after the handshake isn't missed.
-        relay_hub.add_viewer(room, ws)
-        try:
-            await ws.accept()
-            while True:
-                await ws.receive_text()
-        except WebSocketDisconnect:
-            pass
-        finally:
-            relay_hub.remove_viewer(room, ws)
-        return
-    await ws.accept()
-    try:
-        while True:
-            relay_hub.publish(room, await ws.receive_bytes())
-    except WebSocketDisconnect:
-        pass
 
 
 @app.websocket("/ws/frames")

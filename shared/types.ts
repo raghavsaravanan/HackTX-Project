@@ -149,28 +149,7 @@ export interface Scene {
   hazards: string[];
 }
 
-export type Sfx = "step" | "quest" | "levelup" | "fail" | "start" | "combo" | "hint";
-
-export interface Reward {
-  xpGained: number;
-  breakdown: { label: string; xp: number }[];
-  totalXp: number;
-  level: number;
-  leveledUp: boolean;
-  combo: number;
-  sfx: Sfx[];
-}
-
-export interface PlayerStats {
-  xp: number;
-  level: number;
-  xpIntoLevel: number;
-  xpForNextLevel: number;
-  combo: number;
-  bestCombo: number;
-  questsCompleted: number;
-  stepsCompleted: number;
-}
+export type Sfx = "step" | "quest" | "fail" | "start" | "hint";
 
 export type SessionStatus = "idle" | "planning" | "active" | "paused" | "complete";
 
@@ -182,7 +161,6 @@ export interface SessionSnapshot {
   stepStartedAt: number | null;
   questStartedAt: number | null;
   questEndedAt: number | null;
-  stats: PlayerStats;
   narratorName: string;
   /** Say this, e.g. "Hi Lumi", to wake hands-free listening. */
   wakePhrase: string;
@@ -192,6 +170,8 @@ export interface SessionSnapshot {
   /** One entry per quest step, same order. Empty without a quest. */
   missions: MissionState[];
   map: QuestMap;
+  /** The Vision Agent's latest survey of the surroundings: objects with their boxes, and hazards. */
+  scene: Scene | null;
   /** Quests set aside for newer requests, most recent first. Lumi returns to them afterwards. */
   savedQuests: SavedQuestSummary[];
   /** Sharing a finished quest with a contact through Messages; null when not sharing. */
@@ -304,6 +284,45 @@ export interface MissionVerifyRequest {
 
 export type PipelineStage = "vision" | "verify" | "plan" | "agent" | "narrate" | "transcribe" | "hint";
 
+// ---------- API call telemetry ----------
+
+export type ApiProvider = "gemini" | "openai" | "muse" | "elevenlabs";
+
+/** What a call was for. Each maps to one pipeline stage. */
+export type ApiOperation =
+  | "plan"
+  | "agent_turn"
+  | "interpret"
+  | "narrate"
+  | "hint"
+  | "step_observation"
+  | "scene_survey"
+  | "vision_check"
+  | "transcribe"
+  | "speech"
+  | "share_message";
+
+/**
+ * One outbound call to a model or speech service, sent when it starts and again when it ends.
+ * Never carries prompts, images, audio, or credentials; `summary` is a short description of the result.
+ */
+export interface ApiCall {
+  id: string;
+  provider: ApiProvider;
+  model: string;
+  operation: ApiOperation;
+  status: "running" | "ok" | "error";
+  startedAt: number;
+  ms?: number;
+  summary?: string;
+  error?: string;
+  /** Set when this call replaced a failed or unavailable provider. */
+  fallbackFrom?: ApiProvider;
+  fallbackReason?: string;
+  /** 2 or more when the same request is being retried. */
+  attempt?: number;
+}
+
 // ---------- Server-sent events (/api/session/:id/events) ----------
 
 export type ServerEvent =
@@ -313,9 +332,12 @@ export type ServerEvent =
   /** Only this phone page speaks and listens (the newest one), so two open pages never talk over each other. */
   | { type: "speaker"; clientId: string }
   | { type: "say"; id: string; text: string; source: LineSource; sfx?: Sfx[]; priority?: boolean }
-  | { type: "reward"; stepId: string; reward: Reward }
-  | { type: "quest_complete"; questId: string; title: string; recap: string; durationMs: number; stats: PlayerStats }
+  /** A step was confirmed (`stepId`), or the whole quest finished (`stepId` "quest"). */
+  | { type: "progress"; stepId: string; label: string; sfx: Sfx[] }
+  | { type: "quest_complete"; questId: string; title: string; recap: string; durationMs: number; stepsDone: number; stepsTotal: number }
   | { type: "pipeline"; stage: PipelineStage; status: "start" | "done" | "error"; detail?: string; ms?: number }
+  /** Stage-only: an outbound model or speech API call started or finished (process-wide). */
+  | { type: "api_call"; call: ApiCall }
   /** A Vision Agent verdict; `stepId` is set when it was checking a mission, "goal" for the final inspection. */
   | { type: "vision_check"; check: VisionCheck; stepId: string | null }
   /** Stage-only: the latest analyzed frame. */

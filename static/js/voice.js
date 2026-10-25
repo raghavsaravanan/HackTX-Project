@@ -509,9 +509,15 @@ class Cues {
     this.timer = setTimeout(() => this.beat(), gap);
   }
 
-  /** Two rising notes: the agent woke up. One note: a command was understood. */
+  /** Two rising notes: the agent woke up. One note: a command was understood. Three: a step was confirmed. */
   chime(kind) {
     if (!this.ctx) return;
+    if (kind === "step" || kind === "done") {
+      output.hold(700);
+      [523, 659, 784].forEach((f, i) => setTimeout(() => this.tone(f, 0.16, 0, 0.12), i * 110));
+      if (kind === "done") setTimeout(() => this.tone(1047, 0.35, 0, 0.12), 360);
+      return;
+    }
     output.hold(400);
     this.tone(660, 0.12, 0, 0.12);
     if (kind === "wake") setTimeout(() => this.tone(990, 0.16, 0, 0.12), 130);
@@ -723,7 +729,7 @@ export function initGameVoice(els, session) {
           els.state.textContent = `Heard “${body.transcript}”. Say “${wake}” first.`;
           els.state.dataset.mode = "asleep";
         } else {
-          const tip = body.heard === "ignored" ? `To start a new quest, say “${wake}, …”` : `Start with “${wake}”.`;
+          const tip = body.heard === "ignored" ? `To start a new task, say “${wake}, …”` : `Start with “${wake}”.`;
           show(els.said, `Heard “${body.transcript}”. ${tip}`);
         }
       }
@@ -746,14 +752,15 @@ export function initGameVoice(els, session) {
     cloudVoice = Boolean(snap.cloudVoice);
     const quest = snap.quest;
     const step = quest?.steps[snap.stepIndex];
-    els.questTitle.textContent = quest ? quest.title : snap.status === "planning" ? "Planning your quest…" : "No quest yet";
-    els.instruction.textContent = step?.instruction ?? (quest ? "Quest complete." : "Your quest and its steps appear here.");
+    els.questTitle.textContent = quest ? quest.title : snap.status === "planning" ? "Planning your task…" : "No task yet";
+    els.instruction.textContent = step?.instruction ?? (quest ? (snap.status === "complete" ? "Task complete." : "Final check…") : "Your task and its steps appear here.");
     els.steps.replaceChildren(
       ...(quest?.steps ?? []).map((s, i) => {
         const li = document.createElement("li");
         const mission = snap.missions[i]?.status ?? "locked";
         const mark = STATUS_MARK[mission] ?? String(i + 1);
-        li.textContent = `${mark}  ${s.summary || `${s.action} ${s.target}${s.destination ? ` → ${s.destination}` : ""}`}`;
+        const label = s.summary || `${s.action} ${s.target}${s.destination ? ` → ${s.destination}` : ""}`;
+        li.textContent = `${mark}  ${label.charAt(0).toUpperCase()}${label.slice(1)}`;
         li.dataset.status = i === snap.stepIndex && snap.status === "active" ? mission : mission === "done" || mission === "skipped" ? mission : "waiting";
         return li;
       }),
@@ -848,6 +855,8 @@ export function initGameVoice(els, session) {
       if (Date.now() < awakeUntil) awakeUntil = Math.max(awakeUntil, Date.now() + awakeWindow);
       show(els.line, e.text);
       if (els.speakToggle.checked && isSpeaker()) output.narrator.speak(e.id, e.text, e.priority);
+    } else if (e.type === "progress") {
+      if (isSpeaker()) cues.chime(e.stepId === "quest" ? "done" : "step");
     } else if (e.type === "transcript" && e.text) {
       show(els.said, `You said: “${e.text}”`);
     } else if (e.type === "vision_check") {
