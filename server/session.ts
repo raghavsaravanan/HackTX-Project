@@ -22,12 +22,26 @@ import type {
 import { fetchCameraFrame } from "./cameraLink.ts";
 import { config, questMode, redact, visionMode } from "./config.ts";
 import { freshStats, rewardQuest, rewardStep } from "./game.ts";
-import { computeGuidance } from "./guidance.ts";
+import { computeGuidance, type SeenAt } from "./guidance.ts";
 import { anchorLabel, applyNotes, buildMap, findLandmark, markSeen, mergeScene, setPlayerAt } from "./map.ts";
 import { NARRATOR } from "./prompts.ts";
-import { askAgent, describeScene, hint, narrate, parseIntent, planQuest, reactToVerdict, type AgentState, type AgentTurn } from "./questAgent.ts";
+import {
+  askAgent,
+  describeScene,
+  hint,
+  narrate,
+  looksAddressed,
+  parseIntent,
+  planQuest,
+  quickCommand,
+  reactToVerdict,
+  understand,
+  type AgentState,
+  type AgentTurn,
+  type Understanding,
+} from "./questAgent.ts";
 import { cloudVoiceEnabled, registerSpeakLine } from "./tts.ts";
-import { timed } from "./util.ts";
+import { timed, uid } from "./util.ts";
 import { inspect, observeStep, scanScene } from "./vision.ts";
 import { matchWake, wakePhrase } from "./wake.ts";
 
@@ -61,6 +75,12 @@ interface Session {
   surveyFrameId: number;
   verifying: boolean;
   lastVerifyAt: number;
+  /** What the player asked for, used to plan follow-up steps if the goal check fails. */
+  goal: string;
+  /** Rounds of extra steps added because the goal check found the task unfinished. */
+  followUps: number;
+  /** Where quest objects were last seen in the frame, for steering when they leave the view. */
+  lastSeen: Record<string, SeenAt>;
   link: { seq: number; frameId: number; inFlight: boolean };
   /** Hands-free listening: follow-ups need no wake phrase until this time. */
   awakeUntil: number;
@@ -100,6 +120,9 @@ export function getSession(id: string): Session {
       surveyFrameId: -1,
       verifying: false,
       lastVerifyAt: 0,
+      goal: "",
+      followUps: 0,
+      lastSeen: {},
       link: { seq: 0, frameId: -1, inFlight: false },
       awakeUntil: 0,
       armed: false,
@@ -228,7 +251,57 @@ function resetStepState(s: Session) {
   s.lastVerifyAt = 0;
 }
 
-export function startQuest(s: Session, quest: Quest, source: LineSource, scene: Scene | null = null) {
+const STEP_PHRASE: Record<QuestStep["action"], (step: QuestStep) => string> = {
+  find: (st) => `find the ${st.target}`,
+  grab: (st) => `pick up the ${st.target}`,
+  drop: (st) => `drop the ${st.target} in the ${st.destination}`,
+  place: (st) => `put the ${st.target} ${into(st.destination)} the ${st.destination}`,
+  press: (st) => `press the ${st.target}`,
+  open: (st) => `open the ${st.target}`,
+  sit: (st) => `sit on the ${st.target}`,
+  wipe: (st) => `wipe the ${st.target}`,
+  go: (st) => `go to the ${st.target}`,
+  do: (st) => st.target,
+};
+
+const TRASH = /trash|bin|garbage|rubbish|waste/i;
+const CONTAINER = /bag|backpack|box|drawer|basket|bin|can|cabinet|case|pocket|cup|jar|bowl|tray/i;
+const into = (destination: string) => (CONTAINER.test(destination) ? "in" : "on");
+
+/** One phrase per task: "pick up X" followed by "drop X in Y" is spoken as "throw the X in the Y". */
+function taskPhrases(steps: QuestStep[]): string[] {
+  const phrases: string[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const st = steps[i];
+    const next = steps[i + 1];
+    if (st.action === "grab" && next && (next.action === "drop" || next.action === "place") && next.target === st.target && next.destination) {
+      phrases.push(
+        next.summary ||
+          (next.action === "drop" && TRASH.test(next.destination)
+            ? `throw the ${st.target} in the ${next.destination}`
+            : `put the ${st.target} ${into(next.destination)} the ${next.destination}`),
+      );
+      i++;
+      continue;
+    }
+    phrases.push(st.summary || STEP_PHRASE[st.action](st));
+  }
+  return phrases;
+}
+
+/** The whole plan as one spoken line, e.g. "Three tasks: first throw the cup in the trash can, then ..., and finally ...". */
+export function planOverview(steps: QuestStep[]): string {
+  const phrases = taskPhrases(steps);
+  if (phrases.length < 2) return "";
+  const counts = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"];
+  const parts = phrases.map((phrase, i) => {
+    if (i === 0) return `first ${phrase}`;
+    return i === phrases.length - 1 ? `and finally ${phrase}` : `then ${phrase}`;
+  });
+  return `${counts[phrases.length] ?? phrases.length} tasks: ${parts.join(", ")}.`;
+}
+
+export function startQuest(s: Session, quest: Quest, source: LineSource, scene: Scene | null = null, goal = "") {
   if (scene) s.scene = scene;
   s.quest = quest;
   s.status = "active";
@@ -247,23 +320,47 @@ export function startQuest(s: Session, quest: Quest, source: LineSource, scene: 
     lastCheck: null,
   }));
   s.verifying = false;
+  s.goal = goal || quest.goalCheck;
+  s.followUps = 0;
+  s.lastSeen = {};
   resetStepState(s);
   pushSnapshot(s);
-  say(s, `${quest.intro} ${quest.steps[0].instruction}`, source, ["start"], true);
+  const overview = planOverview(quest.steps);
+  say(s, [quest.intro, overview, `Let's start. ${quest.steps[0].instruction}`].filter(Boolean).join(" "), source, ["start"], true);
 }
 
-function setPlanning(s: Session, transcript?: string) {
+function setPlanning(s: Session, transcript?: string, lookingAround = true) {
   s.status = "planning";
   if (transcript) s.lastTranscript = transcript;
   pushSnapshot(s);
-  say(s, "Give me a moment to look around. Hold the phone steady.", "system", undefined, true);
+  say(s, lookingAround ? "Give me a moment to look around. Hold the phone steady." : "Give me a moment to work out a plan.", "system", undefined, true);
 }
+
+const isNetworkError = (message: string) => /fetch failed|timed out|ECONN|ENOTFOUND|socket|network/i.test(message);
 
 function planningFailed(s: Session, message: string) {
   s.status = s.quest ? "active" : "idle";
   pushSnapshot(s);
   broadcast(s, { type: "pipeline", stage: "plan", status: "error", detail: redact(message) });
-  say(s, "I couldn't get a clear look. Try asking again.", "system", ["fail"], true);
+  const line = isNetworkError(message)
+    ? "I can't reach the internet right now, so I couldn't make a plan. Ask me again in a moment."
+    : "I couldn't make a plan for that. Try asking again.";
+  say(s, line, "system", ["fail"], true);
+}
+
+/** Plan, retrying through brief internet drops (common on a phone hotspot). */
+async function planWithRetry(s: Session, goal: string, scene: Scene | null): Promise<Quest> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await planQuest(goal, scene);
+    } catch (err) {
+      const message = (err as Error).message;
+      if (attempt >= 3 || !isNetworkError(message)) throw err;
+      console.warn(`[plan] attempt ${attempt} failed, retrying:`, redact(message).slice(0, 120));
+      if (attempt === 1) say(s, "The connection is slow. Still working on your plan.", "system", undefined, true);
+      await sleep(1500 * attempt);
+    }
+  }
 }
 
 export function recordTranscript(s: Session, text: string) {
@@ -286,7 +383,8 @@ function completeStep(s: Session, check: VisionCheck | null = null) {
   s.stepIndex++;
   const next = currentStep(s);
   if (!next) {
-    finishQuest(s, quest);
+    pushSnapshot(s);
+    void confirmGoal(s, quest);
     return reward;
   }
   setMission(s, s.stepIndex, { status: "active" });
@@ -307,7 +405,95 @@ function completeStep(s: Session, check: VisionCheck | null = null) {
   return reward;
 }
 
-function finishQuest(s: Session, quest: Quest) {
+const MAX_FOLLOW_UPS = 2;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Every step is done, but that doesn't prove the goal is: the Vision Agent checks the whole goal
+ * first. FAIL adds follow-up steps for what is still unfinished; UNCERTAIN asks the player to show
+ * more and looks again; PASS (or no vision available) finishes the quest.
+ */
+async function confirmGoal(s: Session, quest: Quest) {
+  if (!quest.goalCheck || !shouldVerify()) {
+    finishQuest(s, quest);
+    return;
+  }
+  s.verifying = true;
+  say(s, "That's every step. Let me check the whole thing. Hold the phone up and pan slowly across it.", "system", undefined, true);
+  try {
+    let check: VisionCheck | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await sleep(attempt === 0 ? 2500 : 4000); // let fresh frames of the whole area arrive
+      check = await runCheck(s, quest.goalCheck, await cameraFrame(), `The player finished every step of "${quest.title}". Goal: ${s.goal}`, "goal");
+      if (s.quest?.id !== quest.id) return;
+      if (check?.verdict !== "UNCERTAIN") break;
+      if (attempt === 0) say(s, `${check.summary || "I can't see all of it."} Step back a little and pan slowly.`, "system", undefined, true);
+    }
+    if (check) s.map = { ...s.map, goalCheck: check, updatedAt: Date.now() };
+    if (check?.verdict === "FAIL" && s.followUps < MAX_FOLLOW_UPS) {
+      s.followUps++;
+      const what = check.summary || check.evidence[0] || "it isn't finished yet";
+      const change = `Every mission is done, but the goal check "${quest.goalCheck}" failed: ${check.evidence.join("; ") || check.summary}.`;
+      if (await revisePlan(s, quest, change, `Not quite. ${what}`)) return;
+    }
+    finishQuest(s, quest, true);
+    if (check?.verdict === "FAIL") say(s, `One thing still needs attention: ${check.summary || check.evidence[0] || "it isn't quite done."}`, "system");
+  } finally {
+    s.verifying = false;
+  }
+}
+
+/**
+ * Re-plan every mission from the current one onward: after a correction, changed conditions, or a
+ * failed goal check (then the current index is past the end, so new missions are appended).
+ * Finished missions stay; the mission list and map update in place. Returns false if planning failed.
+ */
+async function revisePlan(s: Session, quest: Quest, change: string, opener: string): Promise<boolean> {
+  try {
+    const image = await cameraFrame();
+    const scanned = image ? await scanScene(image, "interactive").catch(() => null) : null;
+    const scene = scanned?.scene ?? s.scene;
+    if (s.quest?.id !== quest.id) return false;
+    const done = quest.steps.slice(0, s.stepIndex).map((st) => st.summary || `${st.action} ${st.target}`);
+    const context = `Already done: ${done.join("; ") || "nothing yet"}. What changed: ${change} Plan only the missions still needed from now on.`;
+    const remaining = await planQuest(s.goal, scene, context);
+    if (s.quest?.id !== quest.id || !remaining.steps.length) return false;
+
+    if (scene) {
+      s.scene = scene;
+      mergeScene(s.map, scene);
+    }
+    const first = Math.min(s.stepIndex, quest.steps.length);
+    const added = remaining.steps.map((step) => ({ ...step, id: uid("s") }));
+    quest.steps.splice(first, quest.steps.length - first, ...added);
+    if (remaining.goalCheck) quest.goalCheck = remaining.goalCheck;
+    if (remaining.analysis) quest.analysis = remaining.analysis;
+    s.missions.splice(
+      first,
+      s.missions.length - first,
+      ...added.map((step, i) => ({
+        stepId: step.id,
+        status: (i === 0 ? "active" : "locked") as MissionState["status"],
+        landmarkId: findLandmark(s.map, anchorLabel(step))?.id ?? null,
+        note: "",
+        attempts: 0,
+        lastCheck: null,
+      })),
+    );
+    s.status = "active";
+    s.stepIndex = first;
+    resetStepState(s);
+    pushSnapshot(s);
+    const mode = questMode();
+    say(s, [opener, planOverview(added), added[0].instruction].filter(Boolean).join(" "), mode === "mock" ? "system" : mode, undefined, true);
+    return true;
+  } catch (err) {
+    console.warn("[replan]", redact((err as Error).message).slice(0, 160));
+    return false;
+  }
+}
+
+function finishQuest(s: Session, quest: Quest, inspected = false) {
   const durationMs = Date.now() - (s.questStartedAt ?? Date.now());
   const { stats, reward } = rewardQuest(s.stats, { type: quest.type, hintsUsed: s.hintsThisQuest });
   s.stats = stats;
@@ -327,7 +513,7 @@ function finishQuest(s: Session, quest: Quest) {
   ).then((line) => {
     say(s, line.text, line.source, undefined, true);
     broadcast(s, { type: "quest_complete", questId: quest.id, title: quest.title, recap: line.text, durationMs, stats: s.stats });
-    void finalInspection(s, quest);
+    if (!inspected) void finalInspection(s, quest);
   });
 }
 
@@ -394,8 +580,16 @@ async function verifyStep(s: Session, step: QuestStep, image: string) {
   try {
     const check = await runCheck(s, step.check, image, `Current step: ${step.action} the ${step.target}. ${step.success}`, step.id);
     if (currentStep(s)?.id !== step.id || s.status !== "active") return;
-    // If the Vision Agent itself is down, fall back to the frame loop's judgement.
-    if (!check || check.verdict === "PASS") {
+    if (!check) {
+      // No verdict is not a PASS: keep the step open and look again after the cooldown.
+      s.doneStreak = 0;
+      s.lastVerifyAt = Date.now();
+      setMission(s, index, { status: "active" });
+      pushSnapshot(s);
+      say(s, "I couldn't confirm that yet. Hold the phone steady on it for a moment.", "system", undefined, true);
+      return;
+    }
+    if (check.verdict === "PASS") {
       completeStep(s, check);
       return;
     }
@@ -456,6 +650,18 @@ export async function askQuestion(s: Session, text: string): Promise<AskResponse
   let missionCompleted = false;
   let changed = applyTurn(s, first);
 
+  const firstStep = currentStep(s);
+  if (await adapt(s, first)) {
+    trackPipeline(s, "agent", "done", Date.now() - started, source);
+    return { reply, source, check, missionCompleted: false, snapshot: snapshot(s) };
+  }
+  // The player's word completes a mission the camera can't confirm.
+  if (first.completeCurrent && firstStep && firstStep.verify === "voice" && s.status === "active") {
+    trackPipeline(s, "agent", "done", Date.now() - started, source);
+    completeStep(s);
+    return { reply, source, check, missionCompleted: true, snapshot: snapshot(s) };
+  }
+
   if (first.visionQuestion) {
     const step = currentStep(s);
     const isMission = !!step && s.status === "active" && first.visionQuestion === step.check;
@@ -465,6 +671,10 @@ export async function askQuestion(s: Session, text: string): Promise<AskResponse
       reply = second.reply || check.summary;
       source = second.source;
       changed = applyTurn(s, second) || changed;
+      if (await adapt(s, second)) {
+        trackPipeline(s, "agent", "done", Date.now() - started, source);
+        return { reply, source, check, missionCompleted: false, snapshot: snapshot(s) };
+      }
       const stillCurrent = !!step && currentStep(s)?.id === step.id && s.status === "active";
       if ((second.completeCurrent || isMission) && check.verdict === "PASS" && stillCurrent) {
         completeStep(s, check);
@@ -486,11 +696,33 @@ export async function askQuestion(s: Session, text: string): Promise<AskResponse
   return { reply, source, check, missionCompleted, snapshot: snapshot(s) };
 }
 
+/**
+ * The Quest Agent asked to skip the current mission or re-plan the rest (a correction or changed
+ * conditions). Returns true when it handled the reply itself.
+ */
+async function adapt(s: Session, turn: AgentTurn): Promise<boolean> {
+  const quest = s.quest;
+  if (!quest || (s.status !== "active" && s.status !== "paused")) return false;
+  if (turn.replan) {
+    say(s, turn.reply || "Got it. Let me rework the plan.", turn.source, undefined, true);
+    if (await revisePlan(s, quest, turn.replan, "Here's the new plan.")) return true;
+    say(s, "I couldn't rework the plan just now. Let's keep going, or tell me what to change.", "system", undefined, true);
+    return true;
+  }
+  if (turn.skipCurrent && currentStep(s)) {
+    if (turn.reply) say(s, turn.reply, turn.source, undefined, true);
+    await runCommand(s, "skip");
+    return true;
+  }
+  return false;
+}
+
 /** One camera frame through the frame loop: guidance for the phone, boxes for the stage, step progress. */
 async function handleFrame(s: Session, seq: number, image: string): Promise<void> {
   const step = currentStep(s);
 
-  if (s.status !== "active" || !step) {
+  // Voice-verified missions don't need frame-by-frame vision; the player says when they're done.
+  if (s.status !== "active" || !step || step.verify === "voice") {
     const guidance = computeGuidance(null, null);
     broadcast(s, { type: "frame", image: image, observation: null, guidance, timing: null }, "stage");
     return;
@@ -508,7 +740,11 @@ async function handleFrame(s: Session, seq: number, image: string): Promise<void
     return;
   }
   const { observation, timing } = result;
-  const guidance = computeGuidance(step, observation);
+  const now = Date.now();
+  const center = (box: { x0: number; x1: number }) => (box.x0 + box.x1) / 2 - 0.5;
+  if (observation.targetBox) s.lastSeen[step.target] = { dx: center(observation.targetBox), at: now };
+  if (observation.destinationBox && step.destination) s.lastSeen[step.destination] = { dx: center(observation.destinationBox), at: now };
+  const guidance = computeGuidance(step, observation, s.lastSeen, now);
   broadcast(s, { type: "frame", image: image, observation, guidance, timing }, "stage");
   broadcast(
     s,
@@ -588,23 +824,28 @@ export async function pollCameraLink() {
 // ---------- Planning and voice dispatch ----------
 
 /** Survey the surroundings, then have the Quest Agent plan a quest for `goal`. Returns null when there is no camera frame. */
-export async function planFromGoal(s: Session, goal: string): Promise<SessionSnapshot | null> {
+export async function planFromGoal(s: Session, goal: string): Promise<SessionSnapshot> {
   const image = await cameraFrame();
-  if (!image) return null;
-  setPlanning(s, goal);
+  setPlanning(s, goal, Boolean(image));
   try {
-    trackPipeline(s, "vision", "start");
-    const scanned = await scanScene(image, "interactive");
-    if (!scanned) throw new Error("Vision busy");
-    const { scene, timing } = scanned;
-    trackPipeline(s, "vision", "done", timing.ms, `${scene.objects.length} objects`);
+    // The camera makes plans concrete, but any goal can be planned without it.
+    let scene: Scene | null = null;
+    if (image) {
+      trackPipeline(s, "vision", "start");
+      const scanned = await scanScene(image, "interactive").catch((err) => {
+        console.warn("[plan] survey failed, planning without the camera:", redact((err as Error).message).slice(0, 120));
+        return null;
+      });
+      scene = scanned?.scene ?? null;
+      trackPipeline(s, "vision", scanned ? "done" : "error", scanned?.timing.ms, scanned ? `${scanned.scene.objects.length} objects` : "no survey");
+    }
 
     trackPipeline(s, "plan", "start");
-    const { value: quest, ms } = await timed(() => planQuest(goal, scene));
+    const { value: quest, ms } = await timed(() => planWithRetry(s, goal, scene));
     trackPipeline(s, "plan", "done", ms, `${quest.steps.length} steps`);
 
     const mode = questMode();
-    startQuest(s, quest, mode === "mock" ? "system" : mode, scene);
+    startQuest(s, quest, mode === "mock" ? "system" : mode, scene, goal);
     return snapshot(s);
   } catch (err) {
     planningFailed(s, (err as Error).message);
@@ -613,31 +854,67 @@ export async function planFromGoal(s: Session, goal: string): Promise<SessionSna
 }
 
 /**
- * Hands-free listening. Speech counts only after the wake phrase ("hi Echo, ...") or within the
- * awake window that follows it. Inside the window, a new quest still needs the wake phrase, so
- * nearby chatter can't replace the player's quest.
+ * Hands-free listening. Each utterance is read by the Quest Agent's understanding step: is it
+ * for Lumi, and is it a new goal, a question, progress, a correction, or a command? Speech
+ * recognition often mangles "Hi Lumi", so the wake phrase helps but isn't required; background
+ * chatter is ignored. Without a reachable model, the wake-phrase rules alone decide.
+ * `typed` text comes from the phone's type box and is always meant for Lumi.
  */
-export function hearUtterance(s: Session, transcript: string): ListenResponse {
+export async function hearUtterance(s: Session, transcript: string, typed = false): Promise<ListenResponse> {
   const now = Date.now();
-  const { woke, rest } = matchWake(transcript);
-  if (!woke && now >= s.awakeUntil) return { transcript, heard: "asleep", intent: null, awakeMs: 0 };
+  const { woke: wakeHeard, rest } = typed ? { woke: true, rest: transcript.trim() } : matchWake(transcript);
+  const awake = wakeHeard || now < s.awakeUntil;
+  const ignore = (): ListenResponse => ({ transcript, heard: awake ? "ignored" : "asleep", intent: null, awakeMs: Math.max(0, s.awakeUntil - now) });
 
-  const trusted = woke || s.armed;
-  const intent = parseIntent(rest);
-  if (!trusted && (intent.type === "start_quest" || intent.type === "unknown")) {
-    return { transcript, heard: "ignored", intent: null, awakeMs: s.awakeUntil - now };
-  }
-  s.armed = false;
-  s.awakeUntil = now + config.agent.awakeMs;
-  if (woke && !rest) {
+  if (wakeHeard && !rest) {
     s.armed = true;
+    s.awakeUntil = now + config.agent.awakeMs;
     recordTranscript(s, transcript);
     say(s, "Yes?", "system", undefined, true);
     return { transcript, heard: "woke", intent: null, awakeMs: config.agent.awakeMs };
   }
-  recordTranscript(s, rest);
+  const text = rest || transcript.trim();
+  // Unprompted fragments ("200", "in a") aren't worth a model call.
+  if (!text || (!awake && text.split(/\s+/).length < 3)) return ignore();
+
+  const trusted = wakeHeard || s.armed;
+  let intent: VoiceIntent | null = awake ? quickCommand(text) : null;
+  if (!intent) {
+    const understood = await understand(agentState(s), text, trusted, awake);
+    if (understood) {
+      if (!understood.addressed && !trusted) return ignore();
+      intent = intentFrom(s, understood, text, trusted);
+    } else {
+      // No model reachable: the wake phrase, or an obvious direct request, decides.
+      const addressed = trusted || looksAddressed(text);
+      if (!awake && !addressed) return ignore();
+      intent = parseIntent(text);
+      if (!addressed && (intent.type === "start_quest" || intent.type === "unknown")) return ignore();
+    }
+  }
+  if (!intent) return ignore();
+  console.log(`[understood] ${intent.type}${"goal" in intent ? ` "${intent.goal}"` : ""} from "${text.slice(0, 80)}"`);
+  s.armed = false;
+  s.awakeUntil = Date.now() + config.agent.awakeMs;
+  recordTranscript(s, text);
   void dispatchIntent(s, intent);
   return { transcript, heard: "command", intent, awakeMs: config.agent.awakeMs };
+}
+
+/** Turn the understanding into something to do. */
+function intentFrom(s: Session, u: Understanding, text: string, trusted: boolean): VoiceIntent | null {
+  switch (u.kind) {
+    case "chatter":
+      return trusted ? { type: "ask", text } : null;
+    case "command":
+      return u.command !== "none" ? { type: u.command } : { type: "ask", text };
+    case "new_goal":
+      // Mid-quest without the wake phrase, a "new goal" is more likely a change of plan: the agent decides.
+      if (s.quest && s.status === "active" && !trusted) return { type: "ask", text };
+      return { type: "start_quest", goal: u.goal || text };
+    default:
+      return { type: "ask", text };
+  }
 }
 
 /** Run a spoken or typed intent on the server; replies reach the phone and stage as `say` events. */
@@ -648,14 +925,14 @@ export async function dispatchIntent(s: Session, intent: VoiceIntent): Promise<v
   const ack = needsAck
     ? setTimeout(() => {
         if (s.lastSayAt <= startedAt) {
-          say(s, intent.type === "start_quest" ? "One sec." : "Let me look.", "system", undefined, true);
+          say(s, intent.type === "describe" ? "Let me look." : "One sec.", "system", undefined, true);
         }
       }, 1500)
     : null;
   try {
     switch (intent.type) {
       case "start_quest":
-        if (!(await planFromGoal(s, intent.goal))) say(s, "I cannot see anything yet. Start the phone camera, then ask again.", "system", undefined, true);
+        await planFromGoal(s, intent.goal);
         return;
       case "ask":
         await askQuestion(s, intent.text);

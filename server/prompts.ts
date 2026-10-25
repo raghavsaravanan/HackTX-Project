@@ -38,6 +38,9 @@ const DONE_RULES: Record<QuestStep["action"], string> = {
   press: "step_done when a fingertip is pressing the target.",
   open: "step_done when the target (door, drawer, lid) is visibly open.",
   sit: "step_done when the view has lowered to seated height directly in front of or on the target seat.",
+  wipe: "step_done only when the target surface is visibly clear and clean (no crumbs, spills, or smudges) and a hand or cloth has just passed over it.",
+  go: "step_done when the target place or object fills much of the view at close range (the player has arrived).",
+  do: "step_done only when the success criteria are clearly met in this frame.",
 };
 
 export function stepVisionPrompt(step: QuestStep): string {
@@ -164,55 +167,125 @@ export const VERIFY_SCHEMA = {
 export const QUEST_SCHEMA = {
   type: "object",
   properties: {
+    // First, so the model reasons about the room before committing to steps.
+    analysis: { type: "string" },
     title: { type: "string" },
     type: { type: "string", enum: ["side", "boss"] },
     intro: { type: "string" },
     steps: {
       type: "array",
       minItems: 1,
-      maxItems: 6,
+      maxItems: 8,
       items: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["find", "grab", "drop", "place", "press", "open", "sit"] },
+          reason: { type: "string" },
+          summary: { type: "string" },
+          action: { type: "string", enum: ["find", "grab", "drop", "place", "press", "open", "sit", "wipe", "go", "do"] },
+          verify: { type: "string", enum: ["vision", "voice"] },
           target: { type: "string" },
           destination: { type: "string" },
           instruction: { type: "string" },
           success: { type: "string" },
           check: { type: "string" },
         },
-        required: ["action", "target", "destination", "instruction", "success", "check"],
+        required: ["reason", "summary", "action", "verify", "target", "destination", "instruction", "success", "check"],
         additionalProperties: false,
       },
     },
     goal_check: { type: "string" },
   },
-  required: ["title", "type", "intro", "steps", "goal_check"],
+  required: ["analysis", "title", "type", "intro", "steps", "goal_check"],
   additionalProperties: false,
 } as const;
 
-export function planPrompt(goal: string, scene: Scene): string {
-  const objects = scene.objects.map((o) => `- ${o.label} (${o.note})`).join("\n") || "- (nothing detected)";
+/** Rough direction from where the player faces, from an object's box in the frame. */
+function sideOf(box: { x0: number; x1: number }): string {
+  const dx = (box.x0 + box.x1) / 2 - 0.5;
+  return dx < -0.15 ? "to the player's left" : dx > 0.15 ? "to the player's right" : "straight ahead";
+}
+
+export function planPrompt(goal: string, scene: Scene | null, context = ""): string {
+  const objects = scene?.objects.map((o) => `- ${o.label} (${sideOf(o.box)}; ${o.note})`).join("\n") || "- (nothing detected)";
+  const surroundings = scene
+    ? [
+        `Surroundings (from the camera): ${scene.setting || "unknown"}`,
+        "Objects currently visible:",
+        objects,
+        scene.hazards.length ? `Hazards: ${scene.hazards.join("; ")}` : "Hazards: none",
+      ]
+    : ["Surroundings: no camera view right now. Plan from the request alone; the player can confirm steps by voice."];
   return [
     `The player said: "${goal}"`,
-    `Surroundings: ${scene.setting || "unknown"}`,
-    "Objects currently visible:",
-    objects,
-    scene.hazards.length ? `Hazards: ${scene.hazards.join("; ")}` : "Hazards: none",
+    context && `Situation: ${context}`,
+    ...surroundings,
     "",
-    "Design a quest that accomplishes the goal using only the objects listed. Every target and destination must be one of those objects, " +
-      "unless the player named it in what they said. Never invent furniture or containers (drawers, shelves, bins) that are not listed.",
+    "The player may ask for anything: a physical chore, finding something, getting somewhere, a routine (getting ready, cooking), or a task with no objects at all. " +
+      "Turn it into a quest of concrete missions they can do one at a time, guided only by your voice.",
+    "Reason before you plan. In analysis (at most 90 words), work out:",
+    "- what the player actually wants and what the situation looks like when it is truly done;",
+    "- which visible objects matter and their role (trash, a belonging with a home, a tool, something that stays), and anything needed that is not visible;",
+    "- the missions that requires, in an order that avoids backtracking, and which ones the camera can confirm.",
+    "Then write steps that follow from your analysis. Do not use a template: the steps depend on this request and this situation.",
     "Rules:",
-    "- 2 to 6 steps. Use type boss for 4 or more steps, otherwise side.",
-    "- Pair manipulation steps: grab X, then drop or place X into the destination. Each grab or drop step includes finding the thing, so do not add separate find steps before them.",
-    "- Use find only to locate something without touching it. Use press, open, sit when the goal calls for them.",
-    "- Skip anything unsafe: knives, scissors, glass, hot items, stoves, outlets.",
-    "- target and destination are short common names matching the object list. destination is an empty string unless the action is drop or place.",
-    "- instruction: one spoken line in your narrator voice, at most 18 words, telling the player what to do and roughly where it is.",
-    "- success: a precise visual check a camera could verify.",
-    '- check: the same check as a yes/no question for the Vision Agent where "yes" means done, e.g. "Is a hand holding the water bottle?"',
-    '- goal_check: one yes/no question confirming the whole goal from a single photo, where "yes" means done, e.g. "Is the desk clear of clutter?"',
-    "- title: a playful quest name, at most 6 words. intro: one spoken line, at most 25 words, kicking off the quest.",
+    "- 1 to 8 steps, only as many as the goal needs. Use type boss for 4 or more steps, otherwise side.",
+    "- Never pretend an object is visible when it is not listed. If the goal needs something not listed, add a find step for it (or plan around it).",
+    "- action: find (locate without touching), grab, drop or place (put the target into or onto the destination), press, open, sit, " +
+      "wipe (clean a surface, after it is cleared), go (move to a place or object), or do (any other action; describe it in instruction).",
+    "- Pair manipulation steps: grab X, then drop or place X. Each grab or drop step includes finding the thing, so no separate find step before them.",
+    "- verify: vision when a single camera photo could confirm the step is done (the result is visible in front of the player); " +
+      "voice when it cannot (the player's own body or knowledge, something out of view, waiting, information steps).",
+    "- Skip anything unsafe: knives, scissors, glass, hot items, stoves, outlets. If the goal needs one, guide the player to ask a sighted person for that part.",
+    "- target: the main object or place, short common name (matching the object list when visible). destination: empty unless action is drop or place.",
+    "- summary: 2 to 6 natural spoken words with articles, e.g. \"find a trash bin\", \"throw the can away\", \"put on your shoes\".",
+    "- reason: a few words on why this step serves the goal.",
+    "- instruction: one spoken line in your narrator voice, at most 20 words, telling the player what to do and where (left, right, ahead) when known.",
+    "- Order steps so each one starts from where the previous one ended, and so the last step leaves the goal fully done.",
+    "- success: what done looks like. check: the same as a yes/no question where \"yes\" means done (for voice steps, a question to ask the player).",
+    '- goal_check: one yes/no question confirming the whole goal from a single photo, or "" if a photo cannot show it.',
+    "- title: a short friendly quest name, at most 6 words. intro: one spoken line, at most 25 words, kicking off the quest.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// ---------- Understanding what the player said ----------
+
+export const INTERPRET_SCHEMA = {
+  type: "object",
+  properties: {
+    addressed_to_agent: { type: "boolean" },
+    kind: { type: "string", enum: ["new_goal", "question", "progress", "correction", "command", "chatter"] },
+    goal: { type: "string" },
+    command: { type: "string", enum: ["none", "repeat", "skip", "pause", "resume", "stop", "describe"] },
+  },
+  required: ["addressed_to_agent", "kind", "goal", "command"],
+  additionalProperties: false,
+} as const;
+
+export function interpretPrompt(state: AgentState, utterance: string, wakeHeard: boolean, awake: boolean): string {
+  const quest = state.quest;
+  const step = quest?.steps[state.stepIndex];
+  return [
+    `You are ${NARRATOR.name}, a voice companion for a blind player. Their phone's speech recognition produced this transcript: "${utterance}"`,
+    wakeHeard
+      ? `It started with your name ("Hi ${NARRATOR.name}"), so it is addressed to you.`
+      : awake
+        ? "You just spoke with the player, so a follow-up is likely addressed to you."
+        : `It did not clearly start with your name. Speech recognition often mangles "Hi ${NARRATOR.name}" (e.g. "Enemy", "Hi Lou me", "Me"), so judge by content.`,
+    quest ? `Active quest: "${quest.title}". Current mission: ${step ? step.summary || `${step.action} ${step.target}` : "none"}.` : "No quest is active.",
+    "",
+    "addressed_to_agent: true if this is the player talking to you (a request, question, answer, or update). " +
+      "False for background speech, TV, fragments with no clear meaning (\"200\", \"in a\"), or talk to someone else.",
+    "kind:",
+    "- new_goal: they want help doing something new (\"help me clean my table\", \"I need to find my keys\", \"get me ready for class\").",
+    "- question: they ask about the room, an object, the quest, or anything else.",
+    "- progress: they report on the current mission (\"I did it\", \"done\", \"I can't find it\", \"got it\").",
+    "- correction: they correct you or change the plan (\"that's not trash\", \"I don't have a cloth\", \"actually let's do the desk instead\").",
+    "- command: one of the commands below.",
+    "- chatter: not meant for you.",
+    "goal: for new_goal, the request in the player's words, cleaned of the wake phrase and recognition errors. Otherwise \"\".",
+    "command: repeat (say that again), skip (skip this step), pause, resume, stop (end the quest), describe (what's around me); otherwise none.",
   ].join("\n");
 }
 
@@ -224,6 +297,8 @@ export const AGENT_TURN_SCHEMA = {
     reply: { type: "string" },
     vision_question: { type: "string" },
     complete_current_mission: { type: "boolean" },
+    skip_current_mission: { type: "boolean" },
+    replan: { type: "string" },
     mission_note: { type: "string" },
     player_near: { type: "string" },
     map_notes: {
@@ -237,7 +312,7 @@ export const AGENT_TURN_SCHEMA = {
       },
     },
   },
-  required: ["reply", "vision_question", "complete_current_mission", "mission_note", "player_near", "map_notes"],
+  required: ["reply", "vision_question", "complete_current_mission", "skip_current_mission", "replan", "mission_note", "player_near", "map_notes"],
   additionalProperties: false,
 } as const;
 
@@ -260,12 +335,13 @@ function describeState({ quest, stepIndex, missions, setting, landmarks, recent 
     const m = missions[i];
     const check = m?.lastCheck ? ` last check ${m.lastCheck.verdict}: ${m.lastCheck.evidence.join("; ")}` : "";
     const marker = i === stepIndex ? " <- CURRENT" : "";
-    return `- [${step.id}] ${m?.status ?? "locked"}: ${step.action} ${step.target}${step.destination ? ` -> ${step.destination}` : ""}. ` +
-      `Check: "${step.check}".${check}${m?.note ? ` Note: ${m.note}` : ""}${marker}`;
+    return `- [${step.id}] ${m?.status ?? "locked"} (verify by ${step.verify ?? "vision"}): ${step.summary || `${step.action} ${step.target}`}${step.destination ? ` -> ${step.destination}` : ""}. ` +
+      `${step.reason ? `Why: ${step.reason}. ` : ""}Check: "${step.check}".${check}${m?.note ? ` Note: ${m.note}` : ""}${marker}`;
   });
   const last = recent.at(-1);
   return [
     `Quest: "${quest.title}". Goal check: "${quest.goalCheck}"`,
+    quest.analysis ? `Your plan's reasoning: ${quest.analysis}` : "",
     "Missions:",
     ...lines,
     ...surroundings,
@@ -278,6 +354,10 @@ function describeState({ quest, stepIndex, missions, setting, landmarks, recent 
 }
 
 const TURN_RULES = [
+  "Adapting the quest:",
+  "- skip_current_mission: true only if the player asks to skip it or it is impossible (the thing is gone, they can't do it).",
+  "- replan: if the player corrects you (\"that's not trash\", \"I don't have a cloth\", \"the bin is full\", \"actually, do X instead\") or conditions changed so " +
+    "the remaining missions no longer fit, describe in one sentence what changed and what the player now wants. The remaining missions will be re-planned from it. Otherwise \"\".",
   "Fields:",
   "- reply: what you say aloud next, at most 35 words, in your narrator voice, ending with one concrete next action when a quest is active.",
   "- mission_note: a few words to record on the current mission (empty string for none).",
@@ -296,9 +376,12 @@ export function agentAskPrompt(state: AgentState, utterance: string): string {
       "set vision_question to one yes/no question for the Vision Agent. Keep the player's meaning and scope: " +
       'if they ask about the whole room ("Is the room clean?"), ask about everything visible, not one part of it. ' +
       'Word it so "yes" is the outcome the player hopes for ("Is the visible room clean and tidy?"), never as its opposite or a negation. ' +
-      "When the player says they are done or asks to check, use the current mission's check question exactly. " +
+      "When the player says they are done or asks to check a mission verified by vision, use the current mission's check question exactly. " +
+      "A mission verified by voice needs no camera: take the player's word. " +
       'Otherwise set vision_question to "" and answer directly from the state above.',
-    "Always set complete_current_mission to false in this pass; only a PASS from the Vision Agent can complete a mission.",
+    "complete_current_mission: for a mission verified by voice, true when the player says they did it. " +
+      "For a mission verified by vision, always false in this pass: only a PASS from the Vision Agent can complete it.",
+    "If no quest is active and the player asks for help with something, answer helpfully in one or two sentences.",
     TURN_RULES,
   ].join("\n");
 }

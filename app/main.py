@@ -31,6 +31,15 @@ STATIC_DIR = ROOT_DIR / "static"
 app = FastAPI(title="Phone Camera -> MacBook (WebRTC)")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+@app.middleware("http")
+async def revalidate_static(request: Request, call_next):
+    """Phones otherwise keep running stale scripts after an update; ETags keep revalidation cheap."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 hub = SignalingHub()
 relay_hub = FrameRelay()
 frames = FrameBuffer(
@@ -126,7 +135,7 @@ def _game_session(session: str | None) -> str:
 @app.post("/api/game/voice")
 async def game_voice(request: Request, session: str | None = None) -> Response:
     """Hands-free listening: one utterance as 16 kHz mono WAV. Muse transcribes it and the game
-    acts on it only after the wake phrase ("hi Echo")."""
+    acts on it only after the wake phrase ("hi Lumi")."""
     audio = await request.body()
     if not audio or len(audio) > _MAX_VOICE_BYTES:
         raise HTTPException(413 if audio else 400, "Send 1 byte to 10 MB of WAV audio")
@@ -154,11 +163,13 @@ async def game_heard(body: GameText, session: str | None = None) -> Response:
     """Hands-free listening, transcribed on the phone by Safari. The game acts on it only after
     the wake phrase, like /api/game/voice, but no audio is uploaded or transcribed."""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             upstream = await client.post(
                 f"{settings.sidequest_api_url}/api/voice/heard",
                 json={"sessionId": _game_session(session), "transcript": body.text},
             )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Lumi is slow to answer (weak internet). Try again in a moment.") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Sidequest game API unreachable at {settings.sidequest_api_url}") from exc
     return Response(upstream.content, status_code=upstream.status_code, media_type="application/json")

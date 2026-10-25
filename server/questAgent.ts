@@ -1,17 +1,18 @@
 // The Quest Agent: plans quests, narrates, hints, answers the player, and decides what to
-// ask the Vision Agent. Gemini first, Muse Spark as fallback, templates with no keys.
-import type { LineSource, Quest, QuestStep, Scene, StepObservation, VisionCheck, VoiceIntent } from "../shared/types.ts";
+// ask the Vision Agent. Gemini first, Muse Spark as fallback; narration falls back to templates with no keys.
+import type { CommandType, LineSource, Quest, QuestStep, Scene, StepObservation, VisionCheck, VoiceIntent } from "../shared/types.ts";
 import { questMode, redact } from "./config.ts";
 import { agentJson, agentText } from "./llm.ts";
-import { PRESETS } from "./presets.ts";
 import {
   AGENT_TURN_SCHEMA,
+  INTERPRET_SCHEMA,
   QUEST_AGENT_SYSTEM,
   QUEST_SCHEMA,
   agentAskPrompt,
   agentVerdictPrompt,
   describePrompt,
   hintPrompt,
+  interpretPrompt,
   narrationPrompt,
   planPrompt,
   type AgentState,
@@ -27,15 +28,21 @@ interface Line {
 
 type PlannedQuest = Omit<Quest, "id" | "steps" | "goalCheck"> & { goal_check: string; steps: Omit<QuestStep, "id">[] };
 
-export async function planQuest(goal: string, scene: Scene): Promise<Quest> {
-  if (questMode() === "mock") return { id: uid("q"), ...structuredClone(PRESETS.desk) };
+/**
+ * Plans a quest by reasoning about the goal and (when the camera is on) the surveyed room.
+ * `context` describes the situation when re-planning mid-quest. Never falls back to a scripted quest.
+ */
+export async function planQuest(goal: string, scene: Scene | null, context = ""): Promise<Quest> {
+  if (questMode() === "mock") throw new Error("Quest planning needs GEMINI_API_KEY or MODEL_API_KEY");
   const { value: planned } = await agentJson<PlannedQuest>({
     system: QUEST_AGENT_SYSTEM,
-    prompt: planPrompt(goal, scene),
+    prompt: planPrompt(goal, scene, context),
     schema: QUEST_SCHEMA,
     name: "quest",
-    timeoutMs: 25000,
+    timeoutMs: 30000,
+    planning: true,
   });
+  console.log(`[plan] "${goal.slice(0, 60)}" -> ${planned.steps.length} steps. Reasoning: ${(planned.analysis ?? "").slice(0, 300)}`);
   const { goal_check, ...rest } = planned;
   return {
     id: uid("q"),
@@ -82,6 +89,10 @@ export interface AgentTurn {
   reply: string;
   visionQuestion: string;
   completeCurrent: boolean;
+  /** Skip the current mission (player asked, or it became impossible). */
+  skipCurrent: boolean;
+  /** What changed, when the remaining missions should be re-planned; "" otherwise. */
+  replan: string;
   missionNote: string;
   playerNear: string;
   mapNotes: { label: string; note: string }[];
@@ -92,6 +103,8 @@ interface RawTurn {
   reply: string;
   vision_question: string;
   complete_current_mission: boolean;
+  skip_current_mission: boolean;
+  replan: string;
   mission_note: string;
   player_near: string;
   map_notes: { label: string; note: string }[];
@@ -111,6 +124,8 @@ async function turn(prompt: string, fallback: () => Omit<AgentTurn, "source">): 
       reply: raw.reply?.trim() ?? "",
       visionQuestion: raw.vision_question?.trim() ?? "",
       completeCurrent: raw.complete_current_mission === true,
+      skipCurrent: raw.skip_current_mission === true,
+      replan: raw.replan?.trim() ?? "",
       missionNote: raw.mission_note?.trim() ?? "",
       playerNear: raw.player_near?.trim() ?? "",
       mapNotes: Array.isArray(raw.map_notes) ? raw.map_notes.slice(0, 4) : [],
@@ -122,7 +137,7 @@ async function turn(prompt: string, fallback: () => Omit<AgentTurn, "source">): 
   }
 }
 
-const noActions = { visionQuestion: "", completeCurrent: false, missionNote: "", playerNear: "", mapNotes: [] };
+const noActions = { visionQuestion: "", completeCurrent: false, skipCurrent: false, replan: "", missionNote: "", playerNear: "", mapNotes: [] };
 const DONE_PATTERN = /\b(done|finished|did it|check|verify)\b/i;
 
 /** First pass over something the player said: answer directly, or name one question for the Vision Agent. */
@@ -151,6 +166,52 @@ export function reactToVerdict(state: AgentState, trigger: string, check: Vision
 }
 
 // ---------- Voice intents ----------
+
+export interface Understanding {
+  addressed: boolean;
+  kind: "new_goal" | "question" | "progress" | "correction" | "command" | "chatter";
+  goal: string;
+  command: CommandType | "none";
+}
+
+/**
+ * Reads one utterance the way a person would: is it for Lumi, and what does the player want?
+ * Robust to speech recognition mangling the wake phrase. Null when no model is reachable.
+ */
+export async function understand(state: AgentState, utterance: string, wakeHeard: boolean, awake: boolean): Promise<Understanding | null> {
+  if (questMode() === "mock") return null;
+  try {
+    const { value } = await agentJson<{ addressed_to_agent: boolean; kind: Understanding["kind"]; goal: string; command: Understanding["command"] }>({
+      system: QUEST_AGENT_SYSTEM,
+      prompt: interpretPrompt(state, utterance, wakeHeard, awake),
+      schema: INTERPRET_SCHEMA,
+      name: "interpretation",
+      timeoutMs: 5000,
+      fast: true,
+    });
+    return { addressed: value.addressed_to_agent === true, kind: value.kind, goal: value.goal?.trim() ?? "", command: value.command ?? "none" };
+  } catch (err) {
+    console.warn("[understand]", redact((err as Error).message).slice(0, 160));
+    return null;
+  }
+}
+
+const ADDRESSED = /^(hi|hey|hello|ok|okay)\b|\b(can you|could you|would you|will you|help me|i need|i want|tell me|show me|guide me)\b/i;
+
+/**
+ * Offline guess at whether speech is meant for Lumi, used only when no model is reachable:
+ * a greeting or a direct request ("can you help me clean my desk") counts even if the
+ * wake phrase was mangled.
+ */
+export const looksAddressed = (text: string) => ADDRESSED.test(text.trim());
+
+/** Instant local match for short commands ("repeat", "skip"), so they don't wait on a model. */
+export function quickCommand(transcript: string): VoiceIntent | null {
+  const text = transcript.trim();
+  if (text.split(/\s+/).length > 4) return null;
+  for (const [pattern, intent] of COMMANDS) if (pattern.test(text)) return intent;
+  return null;
+}
 
 const COMMANDS: [RegExp, VoiceIntent][] = [
   [/\b(repeat|say (that|it) again|what (was|did you say))\b/i, { type: "repeat" }],

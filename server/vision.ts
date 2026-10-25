@@ -1,4 +1,4 @@
-// The Vision Agent: everything that looks at camera frames. Gemini first, Muse Spark vision as fallback.
+// The Vision Agent: everything that looks at camera frames. OpenAI or Gemini first, Muse Spark vision as fallback.
 import type { QuestStep, Scene, SceneObject, StepObservation, Verdict, VisionCheck, VisionTiming } from "../shared/types.ts";
 import { config, hasMuse, redact, visionMode } from "./config.ts";
 import { MOCK_SCENE, mockObservation } from "./mock.ts";
@@ -14,6 +14,7 @@ import {
 } from "./prompts.ts";
 import { geminiCoolingDown, geminiJson } from "./providers/gemini.ts";
 import { museImageMessage, museJson } from "./providers/muse.ts";
+import { openaiJson } from "./providers/openai.ts";
 import { boxFrom1000, clamp, timed } from "./util.ts";
 
 interface RawObservation {
@@ -45,6 +46,7 @@ interface RawVerdict {
 }
 
 type VisionLane = "interactive" | "background";
+type VisionProvider = "gemini" | "muse" | "openai";
 
 /** Interactive work (player asked) runs first; background frame work is dropped while anything is queued or running. */
 let interactiveTail: Promise<unknown> = Promise.resolve();
@@ -85,8 +87,8 @@ async function runBackground<T>(fn: () => Promise<T>): Promise<T | null> {
 
 function scheduleVision<T>(
   lane: VisionLane,
-  fn: () => Promise<{ value: T; provider: "gemini" | "muse" }>,
-): Promise<{ value: T; provider: "gemini" | "muse" } | null> {
+  fn: () => Promise<{ value: T; provider: VisionProvider }>,
+): Promise<{ value: T; provider: VisionProvider } | null> {
   if (lane === "interactive") return queueInteractive(fn);
   return runBackground(fn);
 }
@@ -103,7 +105,7 @@ async function visionJsonNow<T>(
   schema: object,
   name: string,
   system = VISION_SYSTEM,
-): Promise<{ value: T; provider: "gemini" | "muse" }> {
+): Promise<{ value: T; provider: VisionProvider }> {
   const viaMuse = async () => ({
     value: await museJson<T>({
       messages: [{ role: "developer", content: system }, museImageMessage(prompt, image)],
@@ -111,6 +113,27 @@ async function visionJsonNow<T>(
     }),
     provider: "muse" as const,
   });
+  if (visionMode() === "openai") {
+    try {
+      return {
+        value: await openaiJson<T>({
+          system,
+          prompt,
+          image,
+          schema,
+          name,
+          model: config.openai.visionModel,
+          apiKey: config.openai.visionApiKey,
+          reasoningEffort: config.openai.reasoningEffort,
+        }),
+        provider: "openai",
+      };
+    } catch (err) {
+      if (!hasMuse()) throw err;
+      console.warn("[vision] OpenAI failed, using Muse Spark:", redact((err as Error).message).slice(0, 120));
+      return viaMuse();
+    }
+  }
   if (visionMode() !== "gemini" || geminiCoolingDown()) return viaMuse();
   try {
     return {
@@ -124,7 +147,8 @@ async function visionJsonNow<T>(
   }
 }
 
-const modelFor = (provider: "gemini" | "muse") => (provider === "gemini" ? config.gemini.visionModel : config.muse.model);
+const modelFor = (provider: VisionProvider) =>
+  provider === "openai" ? config.openai.visionModel : provider === "gemini" ? config.gemini.visionModel : config.muse.model;
 
 /**
  * Answer one yes/no question about a frame ("Is the room clean?") with PASS, FAIL, or

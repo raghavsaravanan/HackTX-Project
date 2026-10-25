@@ -28,6 +28,8 @@ interface GeminiOptions {
   apiKey?: string;
   maxOutputTokens?: number;
   timeoutMs?: number;
+  /** Overrides GEMINI_THINKING_LEVEL for this call (e.g. more thinking for quest planning). */
+  thinkingLevel?: string;
 }
 
 /** Gemini generateContent: optional inline image, optional schema-constrained JSON. Returns the answer text. */
@@ -40,6 +42,7 @@ export async function geminiGenerate({
   apiKey = config.gemini.apiKey,
   maxOutputTokens,
   timeoutMs = 15000,
+  thinkingLevel = config.gemini.thinkingLevel,
 }: GeminiOptions): Promise<string> {
   if (geminiCoolingDown()) throw new Error("Gemini cooling down after quota limit");
   const parts: object[] = [];
@@ -55,7 +58,7 @@ export async function geminiGenerate({
     generationConfig: {
       ...(schema ? { responseMimeType: "application/json", responseJsonSchema: stripAdditionalProperties(schema) } : {}),
       ...(maxOutputTokens ? { maxOutputTokens } : {}),
-      thinkingConfig: { thinkingLevel: config.gemini.thinkingLevel },
+      thinkingConfig: { thinkingLevel },
       ...(image ? { mediaResolution: "MEDIA_RESOLUTION_MEDIUM" } : {}),
     },
   };

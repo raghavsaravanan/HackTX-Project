@@ -83,7 +83,7 @@ export function Hub() {
 }
 
 function Connect({ camera, health, phoneOpen, streaming }: { camera: CameraInfo | null; health: Health | null; phoneOpen: boolean; streaming: boolean }) {
-  const wake = health?.agent.wakePhrase ?? "Hi Echo";
+  const wake = health?.agent.wakePhrase ?? "Hi Lumi";
   return (
     <section className="connect">
       <div className="connect-qr">
@@ -96,7 +96,7 @@ function Connect({ camera, health, phoneOpen, streaming }: { camera: CameraInfo 
           <li className={phoneOpen ? "done" : ""}>Scan the code with the phone camera. Same Wi-Fi as this laptop. Accept the certificate warning once.</li>
           <li className={streaming ? "done" : ""}>Tap Start on the phone and allow the camera and microphone.</li>
           <li>
-            Say “{wake}, help me tidy my desk.” {health?.agent.name ?? "Echo"} plans a quest from what the camera sees and talks you through it.
+            Say “{wake}, help me tidy my desk.” {health?.agent.name ?? "Lumi"} plans a quest from what the camera sees and talks you through it.
           </li>
           <li>
             Ask anything after “{wake}”, such as “is the room clean?”, or say “I'm done” after a step. Follow-ups within a few seconds need no wake phrase.
@@ -111,7 +111,7 @@ function Connect({ camera, health, phoneOpen, streaming }: { camera: CameraInfo 
 function Apis({ health }: { health: Health | null }) {
   const rows: { job: string; service: string; model: string; where: string }[] = [
     { job: "Hear", service: "Meta Muse Voice Transcribe", model: health?.transcribe ?? "…", where: "Phone mic → camera server /api/game/voice → game API /api/voice/listen" },
-    { job: "Wake", service: "Wake phrase match (no API)", model: health?.agent.wakePhrase ?? "Hi Echo", where: "Game API, server/wake.ts, on each transcript" },
+    { job: "Wake", service: "Wake phrase match (no API)", model: health?.agent.wakePhrase ?? "Hi Lumi", where: "Game API, server/wake.ts, on each transcript" },
     { job: "Plan, guide, answer", service: "Gemini Quest Agent", model: health?.quest ?? "…", where: "server/questAgent.ts" },
     { job: "See, verify", service: "Gemini Vision Agent", model: health?.vision ?? "…", where: "server/vision.ts, on 1 frame per second from the phone" },
     { job: "Fallback brain", service: "Meta Muse Spark", model: health?.muse ?? "…", where: "Used when Gemini is rate-limited or down" },

@@ -127,7 +127,7 @@ export function Stage({ health }: { health: Health | null }) {
     <div className="stage">
       <header className="stage-header">
         <span className="brand-tag">
-          Say “{snapshot?.wakePhrase ?? "Hi Echo"}, …” on the phone. Muse hears, Gemini sees and guides.
+          Say “{snapshot?.wakePhrase ?? "Hi Lumi"}, …” on the phone. Muse hears, Gemini sees and guides.
         </span>
         <div className="header-right">
           <StatusPill status={snapshot?.status ?? "idle"} />
@@ -158,11 +158,11 @@ export function Stage({ health }: { health: Health | null }) {
       <footer className="subtitle-bar">
         {transcript && <div className="you-said">Player: “{transcript}”</div>}
         <div className="subtitle-speaker">
-          {snapshot?.narratorName ?? "Sir Echo"}
+          {snapshot?.narratorName ?? "Sir Lumi"}
           <span className="subtitle-source">{SOURCE_LABEL[subtitle?.source ?? "system"]}</span>
         </div>
         <div key={subtitle?.key} className="subtitle-text">
-          {subtitle?.text ?? "Waiting for Echo…"}
+          {subtitle?.text ?? "Waiting for Lumi…"}
         </div>
       </footer>
 
@@ -305,7 +305,7 @@ function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: 
     return (
       <section className="card">
         <div className="panel-title">Quest</div>
-        <p className="muted">On the phone, say “{snapshot?.wakePhrase ?? "Hi Echo"}, help me clean my desk” to begin.</p>
+        <p className="muted">On the phone, say “{snapshot?.wakePhrase ?? "Hi Lumi"}, help me clean my desk” to begin.</p>
       </section>
     );
   }
@@ -326,7 +326,7 @@ function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: 
             <li key={step.id} className={`step step-${state} ${mission ? `mission-row-${mission}` : ""}`}>
               <span className="step-icon">{state === "done" ? "✓" : i + 1}</span>
               <span className="step-body">
-                <span className="step-action">{step.action}</span> {step.target}
+                <span className="step-action">{step.action}</span> {step.summary || step.target}
                 {step.destination && <span className="step-dest"> → {step.destination}</span>}
               </span>
               {mission === "verifying" && <span className="step-flag">checking</span>}

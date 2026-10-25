@@ -143,7 +143,7 @@ function MissionDetail({ index, step, mission, busy, onVerify }: { index: number
     <div className="map-detail">
       <div className="map-detail-head">
         <strong>
-          {index + 1}. {step.action} {step.target}
+          {index + 1}. {step.summary || `${step.action} ${step.target}`}
           {step.destination && ` → ${step.destination}`}
         </strong>
         <span className={`mission-status mission-${mission?.status ?? "locked"}`}>{STATUS_LABEL[mission?.status ?? "locked"]}</span>

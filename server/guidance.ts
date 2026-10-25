@@ -4,12 +4,34 @@ import { clamp } from "./util.ts";
 const IDLE: Guidance = { phase: "idle", pan: 0, proximity: 0, say: "", navBox: null };
 
 const DISTANCE_PROXIMITY: Record<Distance, number> = { far: 0.15, near: 0.4, within_reach: 0.72, touching: 0.95 };
+/** How long a remembered position is trusted once the thing leaves the view. */
+const MEMORY_MS = 10000;
 
-/** Turns one observation into audio-cue parameters. Pure, so the phone can mirror it if needed. */
-export function computeGuidance(step: QuestStep | null, obs: StepObservation | null): Guidance {
+/** Where something was last seen: horizontal offset from center (-0.5 left .. 0.5 right) and when. */
+export interface SeenAt {
+  dx: number;
+  at: number;
+}
+
+/** Which thing the player should head for: the target until they hold it, then the destination. */
+export function navTarget(step: QuestStep, obs: StepObservation | null): string {
+  const carrying = (step.action === "drop" || step.action === "place") && step.destination !== "" && (obs?.holdingTarget ?? false);
+  return carrying ? step.destination : step.target;
+}
+
+/**
+ * Turns one observation into audio-cue parameters. `lastSeen` remembers where things were seen,
+ * so the player is steered back toward a target that just left the view instead of told to sweep.
+ */
+export function computeGuidance(
+  step: QuestStep | null,
+  obs: StepObservation | null,
+  lastSeen: Record<string, SeenAt> = {},
+  now = Date.now(),
+): Guidance {
   if (!step || !obs) return IDLE;
 
-  const toDestination = (step.action === "drop" || step.action === "place") && step.destination !== "";
+  const toDestination = navTarget(step, obs) === step.destination && step.destination !== "";
   const navName = toDestination ? step.destination : step.target;
   const navBox = toDestination ? obs.destinationBox : obs.targetBox;
   const hazard = obs.hazard ? `Careful, ${obs.hazard}. ` : "";
@@ -17,7 +39,12 @@ export function computeGuidance(step: QuestStep | null, obs: StepObservation | n
   if (obs.stepDone) return { phase: "verify", pan: 0, proximity: 1, say: "", navBox };
 
   if (!navBox) {
-    return { phase: "scan", pan: 0, proximity: 0, say: `${hazard}Sweep slowly to find the ${navName}.`, navBox: null };
+    const seen = lastSeen[navName];
+    if (seen && now - seen.at < MEMORY_MS && Math.abs(seen.dx) > 0.05) {
+      const side = seen.dx < 0 ? "left" : "right";
+      return { phase: "scan", pan: seen.dx < 0 ? -0.6 : 0.6, proximity: 0, say: `${hazard}The ${navName} was to your ${side}. Turn ${side} slowly.`, navBox: null };
+    }
+    return { phase: "scan", pan: 0, proximity: 0, say: `${hazard}Sweep slowly left and right to find the ${navName}.`, navBox: null };
   }
 
   const dx = (navBox.x0 + navBox.x1) / 2 - 0.5;

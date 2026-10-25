@@ -9,7 +9,10 @@ export interface Box {
   y1: number;
 }
 
-export type StepAction = "find" | "grab" | "drop" | "place" | "press" | "open" | "sit";
+export type StepAction = "find" | "grab" | "drop" | "place" | "press" | "open" | "sit" | "wipe" | "go" | "do";
+
+/** How a step is confirmed: by the Vision Agent through the camera, or by the player saying it's done. */
+export type StepVerify = "vision" | "voice";
 
 export interface QuestStep {
   id: string;
@@ -24,6 +27,12 @@ export interface QuestStep {
   success: string;
   /** Yes/no question the Vision Agent answers to confirm the step, e.g. "Is the bottle inside the trash can?" */
   check: string;
+  /** Why this step serves the goal, from the Quest Agent's plan (e.g. "the cup is empty, so it's trash"). */
+  reason?: string;
+  /** A few words for the spoken plan and the quest map, e.g. "boil the water". */
+  summary?: string;
+  /** vision: the camera confirms it. voice: the player says when it's done. Defaults to vision. */
+  verify?: StepVerify;
 }
 
 export type QuestType = "side" | "boss";
@@ -36,6 +45,8 @@ export interface Quest {
   steps: QuestStep[];
   /** Whole-quest question for the final inspection, e.g. "Is the desk clear of clutter?" */
   goalCheck: string;
+  /** The Quest Agent's reasoning behind the plan: what the goal means here and what counts as done. */
+  analysis?: string;
 }
 
 // ---------- Vision Agent checks ----------
@@ -173,7 +184,7 @@ export interface SessionSnapshot {
   questEndedAt: number | null;
   stats: PlayerStats;
   narratorName: string;
-  /** Say this, e.g. "Hi Echo", to wake hands-free listening. */
+  /** Say this, e.g. "Hi Lumi", to wake hands-free listening. */
   wakePhrase: string;
   /** ElevenLabs TTS is available for narration on the phone and hub. */
   cloudVoice: boolean;
@@ -227,7 +238,7 @@ export interface ListenResponse {
 }
 
 /** Which model produced a line: a Gemini agent, Muse Spark (fallback brain), or a canned template. */
-export type LineSource = "gemini" | "muse" | "system";
+export type LineSource = "gemini" | "muse" | "openai" | "system";
 
 export interface AskRequest {
   sessionId: string;

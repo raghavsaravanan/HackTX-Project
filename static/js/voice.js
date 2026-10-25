@@ -1,6 +1,6 @@
 // Phone side of the game, hands-free: Safari's speech recognition turns each utterance into text
 // on the phone (or, where that's unavailable, a small voice detector cuts each utterance and the
-// server transcribes it), and the game acts only after the wake phrase ("Hi Echo"). Narration and directional beeps come back over the event stream.
+// server transcribes it), and the game acts only after the wake phrase ("Hi Lumi"). Narration and directional beeps come back over the event stream.
 
 const TARGET_RATE = 16000;
 const CHUNK = 2048;
@@ -105,21 +105,29 @@ class Listener {
 
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // Errors that mean on-phone recognition will never work here; fall back to recording audio.
-const FATAL_SPEECH_ERRORS = new Set(["not-allowed", "service-not-allowed", "language-not-supported", "audio-capture"]);
+const FATAL_SPEECH_ERRORS = new Set(["service-not-allowed", "language-not-supported", "audio-capture"]);
+// Consecutive network errors before giving up on the phone's recognizer.
+const MAX_NETWORK_ERRORS = 3;
 
 /**
  * Hands-free listening transcribed on the phone (Safari speech recognition, on-device on recent
  * iPhones), so only text crosses the network. One utterance per recognition session; it restarts
- * itself and stays paused while the phone is talking, so it doesn't hear its own narration.
+ * itself, backs off after errors, and stays paused while the phone is talking so it doesn't hear
+ * its own narration. If iOS revokes permission (e.g. after the screen locked), it waits for a tap.
  */
 class BrowserListener {
-  constructor({ onText, onSpeechStart, onSpeechEnd, isMuted, onFatal }) {
-    Object.assign(this, { onText, onSpeechStart, onSpeechEnd, isMuted, onFatal });
+  constructor({ onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap }) {
+    Object.assign(this, { onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap });
     this.enabled = true;
     this.rec = null;
     this.active = false;
     this.failed = false;
+    this.worked = false;
+    this.waitingForTap = false;
     this.interim = "";
+    this.retryAt = 0;
+    this.networkErrors = 0;
+    this.startFailures = 0;
   }
 
   get running() {
@@ -134,7 +142,12 @@ class BrowserListener {
     rec.continuous = false;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
+    rec.onstart = () => {
+      this.worked = true;
+      this.startFailures = 0;
+    };
     rec.onresult = (e) => {
+      this.networkErrors = 0;
       if (!this.enabled || this.isMuted()) return;
       let final = "";
       let interim = "";
@@ -150,10 +163,22 @@ class BrowserListener {
       if (final.trim()) this.emit(final.trim());
     };
     rec.onerror = (e) => {
-      if (!FATAL_SPEECH_ERRORS.has(e.error)) return;
-      this.failed = true;
-      clearInterval(this.timer);
-      this.onFatal(e.error);
+      if (e.error === "not-allowed") {
+        // Worked before, so iOS revoked it (screen locked, app switched): one tap brings it back.
+        if (this.worked) this.waitForTap();
+        else this.fail(e.error);
+        return;
+      }
+      if (FATAL_SPEECH_ERRORS.has(e.error)) {
+        this.fail(e.error);
+        return;
+      }
+      if (e.error === "network" && ++this.networkErrors >= MAX_NETWORK_ERRORS) {
+        this.fail(e.error);
+        return;
+      }
+      // no-speech and aborted are routine; anything else waits a little before retrying.
+      if (e.error !== "no-speech" && e.error !== "aborted") this.retryAt = Date.now() + Math.min(5000, 1000 * Math.max(1, this.networkErrors));
     };
     rec.onend = () => {
       this.active = false;
@@ -167,6 +192,30 @@ class BrowserListener {
     this.begin();
   }
 
+  fail(error) {
+    if (this.failed) return;
+    this.failed = true;
+    clearInterval(this.timer);
+    try {
+      this.rec.abort();
+    } catch {
+      /* already stopped */
+    }
+    this.onFatal(error);
+  }
+
+  waitForTap() {
+    if (this.waitingForTap) return;
+    this.waitingForTap = true;
+    this.onNeedTap();
+    const resume = () => {
+      this.waitingForTap = false;
+      this.retryAt = 0;
+      this.begin(); // inside the tap, so iOS allows it
+    };
+    document.addEventListener("pointerup", resume, { once: true });
+  }
+
   emit(text) {
     this.interim = "";
     this.onSpeechEnd();
@@ -177,18 +226,19 @@ class BrowserListener {
     try {
       this.rec.start();
       this.active = true;
-    } catch {
-      /* already started */
+    } catch (err) {
+      // InvalidStateError means it is already running; anything else, give up after a few tries.
+      if (err?.name !== "InvalidStateError" && ++this.startFailures >= 3) this.fail(err?.name || "start-failed");
     }
   }
 
   tick() {
-    if (this.failed) return;
+    if (this.failed || this.waitingForTap) return;
     const wanted = this.enabled && !this.isMuted();
     if (!wanted && this.active) {
       this.interim = "";
       this.rec.abort();
-    } else if (wanted && !this.active) this.begin();
+    } else if (wanted && !this.active && Date.now() >= this.retryAt) this.begin();
   }
 }
 
@@ -439,7 +489,7 @@ export function initGameVoice(els, session) {
   const cues = new Cues();
   const query = session ? `?session=${encodeURIComponent(session)}` : "";
   let ctx = null;
-  let wake = "Hi Echo";
+  let wake = "Hi Lumi";
   let awakeUntil = 0;
   let awakeWindow = 20000;
   let hearing = false;
@@ -472,6 +522,10 @@ export function initGameVoice(els, session) {
     else [text, mode] = [`Say “${wake}” to talk to me.`, "asleep"];
     els.state.textContent = text;
     els.state.dataset.mode = mode;
+    // Which recognizer is listening, shown small under the status: "on-phone" (Safari) or "server".
+    const onPhone = Boolean(browserListener) && !browserListener.failed;
+    els.state.dataset.engine = onPhone ? "on-phone" : "server";
+    els.state.title = onPhone ? "Speech is recognized on this phone" : "Speech is recorded and transcribed on the laptop";
   };
   setInterval(renderState, 500);
 
@@ -515,6 +569,16 @@ export function initGameVoice(els, session) {
           // On-phone recognition is off (e.g. Dictation disabled); record audio for the server instead.
           console.warn("Speech recognition unavailable:", error);
           void startRecorder();
+        },
+        onNeedTap: () => {
+          notice = "Tap the screen once so I can keep listening.";
+          renderState();
+          output.narrator?.speak(null, "Tap the screen once so I can keep listening.", true);
+          const clear = () => {
+            notice = "";
+            renderState();
+          };
+          document.addEventListener("pointerup", clear, { once: true });
         },
       })
     : null;
@@ -617,7 +681,7 @@ export function initGameVoice(els, session) {
         const li = document.createElement("li");
         const mission = snap.missions[i]?.status ?? "locked";
         const mark = STATUS_MARK[mission] ?? String(i + 1);
-        li.textContent = `${mark}  ${s.action} ${s.target}${s.destination ? ` → ${s.destination}` : ""}`;
+        li.textContent = `${mark}  ${s.summary || `${s.action} ${s.target}${s.destination ? ` → ${s.destination}` : ""}`}`;
         li.dataset.status = i === snap.stepIndex && snap.status === "active" ? mission : mission === "done" || mission === "skipped" ? mission : "waiting";
         return li;
       }),
