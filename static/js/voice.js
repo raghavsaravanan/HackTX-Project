@@ -1,6 +1,6 @@
-// Phone side of the game, hands-free: the mic stays open, a small voice detector cuts each
-// utterance, Muse Voice Transcribe turns it into text, and the game acts only after the wake
-// phrase ("Hi Echo"). Narration and directional beeps come back over the event stream.
+// Phone side of the game, hands-free: Safari's speech recognition turns each utterance into text
+// on the phone (or, where that's unavailable, a small voice detector cuts each utterance and the
+// server transcribes it), and the game acts only after the wake phrase ("Hi Echo"). Narration and directional beeps come back over the event stream.
 
 const TARGET_RATE = 16000;
 const CHUNK = 2048;
@@ -100,6 +100,95 @@ class Listener {
     this.onSpeechEnd();
     if (voicedMs < MIN_VOICED_MS) return;
     this.onUtterance(encodeWav(downsample(concat(chunks), this.ctx.sampleRate, TARGET_RATE), TARGET_RATE));
+  }
+}
+
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+// Errors that mean on-phone recognition will never work here; fall back to recording audio.
+const FATAL_SPEECH_ERRORS = new Set(["not-allowed", "service-not-allowed", "language-not-supported", "audio-capture"]);
+
+/**
+ * Hands-free listening transcribed on the phone (Safari speech recognition, on-device on recent
+ * iPhones), so only text crosses the network. One utterance per recognition session; it restarts
+ * itself and stays paused while the phone is talking, so it doesn't hear its own narration.
+ */
+class BrowserListener {
+  constructor({ onText, onSpeechStart, onSpeechEnd, isMuted, onFatal }) {
+    Object.assign(this, { onText, onSpeechStart, onSpeechEnd, isMuted, onFatal });
+    this.enabled = true;
+    this.rec = null;
+    this.active = false;
+    this.failed = false;
+    this.interim = "";
+  }
+
+  get running() {
+    return Boolean(this.rec) && !this.failed;
+  }
+
+  /** Call synchronously inside the Start tap: iOS only grants speech recognition from a gesture. */
+  start() {
+    if (this.rec) return;
+    const rec = new Recognition();
+    rec.lang = navigator.language || "en-US";
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    rec.onresult = (e) => {
+      if (!this.enabled || this.isMuted()) return;
+      let final = "";
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const text = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += text;
+        else interim += text;
+      }
+      if (interim.trim()) {
+        this.interim = interim.trim();
+        this.onSpeechStart();
+      }
+      if (final.trim()) this.emit(final.trim());
+    };
+    rec.onerror = (e) => {
+      if (!FATAL_SPEECH_ERRORS.has(e.error)) return;
+      this.failed = true;
+      clearInterval(this.timer);
+      this.onFatal(e.error);
+    };
+    rec.onend = () => {
+      this.active = false;
+      // iOS sometimes ends a session without marking the last result final.
+      if (this.interim && this.enabled && !this.isMuted()) this.emit(this.interim);
+      this.interim = "";
+      this.onSpeechEnd();
+    };
+    this.rec = rec;
+    this.timer = setInterval(() => this.tick(), 250);
+    this.begin();
+  }
+
+  emit(text) {
+    this.interim = "";
+    this.onSpeechEnd();
+    this.onText(text);
+  }
+
+  begin() {
+    try {
+      this.rec.start();
+      this.active = true;
+    } catch {
+      /* already started */
+    }
+  }
+
+  tick() {
+    if (this.failed) return;
+    const wanted = this.enabled && !this.isMuted();
+    if (!wanted && this.active) {
+      this.interim = "";
+      this.rec.abort();
+    } else if (wanted && !this.active) this.begin();
   }
 }
 
@@ -375,8 +464,8 @@ export function initGameVoice(els, session) {
     let text;
     let mode = "idle";
     if (notice) text = notice;
-    else if (!listener.running) text = `Tap Start, then say “${wake}, help me tidy my desk.”`;
-    else if (!listener.enabled) text = "Listening is off. Turn it on below, or type.";
+    else if (!active().running) text = `Tap Start, then say “${wake}, help me tidy my desk.”`;
+    else if (!active().enabled) text = "Listening is off. Turn it on below, or type.";
     else if (hearing) [text, mode] = ["Hearing you…", "hearing"];
     else if (pending || thinking) [text, mode] = ["Thinking…", "busy"];
     else if (Date.now() < awakeUntil) [text, mode] = ["I'm listening. Go ahead.", "awake"];
@@ -403,6 +492,54 @@ export function initGameVoice(els, session) {
     },
   });
 
+  const browserListener = Recognition
+    ? new BrowserListener({
+        isMuted: () => output.busy(),
+        onSpeechStart: () => {
+          hearing = true;
+          renderState();
+        },
+        onSpeechEnd: () => {
+          hearing = false;
+          renderState();
+        },
+        onText: (text) => {
+          pending++;
+          renderState();
+          void sendText(text).finally(() => {
+            pending--;
+            renderState();
+          });
+        },
+        onFatal: (error) => {
+          // On-phone recognition is off (e.g. Dictation disabled); record audio for the server instead.
+          console.warn("Speech recognition unavailable:", error);
+          void startRecorder();
+        },
+      })
+    : null;
+  /** The listener in use: on-phone recognition unless it failed, else the audio recorder. */
+  const active = () => (browserListener?.running ? browserListener : listener);
+
+  async function startRecorder() {
+    if (!ctx || listener.running) return;
+    try {
+      await listener.start(ctx);
+      notice = "";
+    } catch (err) {
+      notice = `Microphone blocked (${err.message}). You can still type below.`;
+    }
+    renderState();
+  }
+
+  async function sendText(text) {
+    await post(`/api/game/heard${query}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  }
+
   async function drainUtterances() {
     if (sending) return;
     while (latestWav) {
@@ -426,15 +563,15 @@ export function initGameVoice(els, session) {
   }
 
   async function send(wav) {
+    await post(`/api/game/voice${query}`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav });
+  }
+
+  /** Sends one utterance (audio or on-phone text) and reacts to what the game heard. */
+  async function post(url, init) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch(`/api/game/voice${query}`, {
-        method: "POST",
-        headers: { "Content-Type": "audio/wav" },
-        body: wav,
-        signal: ctrl.signal,
-      });
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? body.detail ?? `HTTP ${res.status}`);
       notice = "";
@@ -530,6 +667,7 @@ export function initGameVoice(els, session) {
 
   els.listenToggle.addEventListener("change", () => {
     listener.enabled = els.listenToggle.checked;
+    if (browserListener) browserListener.enabled = els.listenToggle.checked;
     renderState();
   });
 
@@ -564,16 +702,14 @@ export function initGameVoice(els, session) {
       }
       void ctx.resume();
       output.narrator?.unlock();
+      browserListener?.start();
     },
     async listen() {
-      if (!ctx || listener.running) return;
-      try {
-        await listener.start(ctx);
-        notice = "";
-      } catch (err) {
-        notice = `Microphone blocked (${err.message}). You can still type below.`;
+      if (browserListener?.running) {
+        renderState();
+        return;
       }
-      renderState();
+      await startRecorder();
     },
   };
 }

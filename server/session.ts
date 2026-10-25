@@ -554,8 +554,23 @@ async function handleFrame(s: Session, seq: number, image: string): Promise<void
   maybeHint(s, step);
 }
 
+// ---------- Voice before vision ----------
+
+let visionHolds = 0;
+
+/** Pause frame and survey uploads (e.g. while a voice clip is transcribed). Call the result to resume. */
+export function holdVision(): () => void {
+  visionHolds++;
+  let released = false;
+  return () => {
+    if (!released) visionHolds--;
+    released = true;
+  };
+}
+
 /** Feed the camera server's newest phone frame into every active quest. */
 export async function pollCameraLink() {
+  if (visionHolds > 0) return;
   const idle = [...sessions.values()].filter((s) => s.status === "active" && !s.link.inFlight);
   if (!idle.length) return;
   const frame = await fetchCameraFrame();
@@ -669,7 +684,7 @@ let surveying = false;
  * `only` forces an immediate survey of one session.
  */
 export async function surveySurroundings(only?: Session) {
-  if (surveying || visionMode() === "mock") return;
+  if (surveying || visionMode() === "mock" || (!only && visionHolds > 0)) return;
   const targets = only
     ? [only]
     : [...sessions.values()].filter((s) => s.status !== "planning" && s.status !== "active" && s.subscribers.size > 0);

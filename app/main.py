@@ -149,6 +149,21 @@ class GameText(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
 
+@app.post("/api/game/heard")
+async def game_heard(body: GameText, session: str | None = None) -> Response:
+    """Hands-free listening, transcribed on the phone by Safari. The game acts on it only after
+    the wake phrase, like /api/game/voice, but no audio is uploaded or transcribed."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            upstream = await client.post(
+                f"{settings.sidequest_api_url}/api/voice/heard",
+                json={"sessionId": _game_session(session), "transcript": body.text},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Sidequest game API unreachable at {settings.sidequest_api_url}") from exc
+    return Response(upstream.content, status_code=upstream.status_code, media_type="application/json")
+
+
 @app.get("/api/game/tts/{line_id}")
 async def game_tts(line_id: str) -> Response:
     """Stream narration audio for a server-issued line id."""

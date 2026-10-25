@@ -5,6 +5,7 @@ import { config, hasElevenLabs, hasGemini, hasMuse, questMode, redact, visionMod
 import { speakLineAudio } from "./tts.ts";
 import { PRESETS } from "./presets.ts";
 import { geminiStatus } from "./providers/gemini.ts";
+import { elevenLabsTranscribe } from "./providers/elevenlabs.ts";
 import { museTranscribe } from "./providers/muse.ts";
 import { visionQueueStatus } from "./vision.ts";
 import { parseIntent } from "./questAgent.ts";
@@ -14,6 +15,7 @@ import {
   dispatchIntent,
   getSession,
   hearUtterance,
+  holdVision,
   planFromGoal,
   pollCameraLink,
   recordTranscript,
@@ -42,7 +44,7 @@ app.get(
     res.json({
       agent: { name: config.agent.name, wakePhrase: wakePhrase() },
       muse: hasMuse() ? config.muse.model : "mock",
-      transcribe: hasMuse() ? config.muse.transcribeModel : "unavailable",
+      transcribe: transcribeModel() ?? "unavailable",
       speak: hasElevenLabs() ? `ElevenLabs (${config.elevenlabs.model})` : "on-device",
       vision: modelName(visionMode(), config.gemini.visionModel),
       quest: modelName(questMode(), config.gemini.questModel),
@@ -126,34 +128,72 @@ app.post(
 const BASE_KEYWORDS = ["quest", "skip", "repeat", "pause", "resume", "done", "check"];
 const wavBody = express.raw({ type: ["audio/wav", "audio/x-wav", "application/octet-stream"], limit: "16mb" });
 
-/** Muse Voice Transcribe, biased toward the words this session is likely to hear: quest objects and recognized landmarks. */
+/** The speech-to-text model in use: ElevenLabs Scribe first, then Muse Voice Transcribe. */
+function transcribeModel(): string | null {
+  if (hasElevenLabs()) return `ElevenLabs ${config.elevenlabs.sttModel}`;
+  return hasMuse() ? config.muse.transcribeModel : null;
+}
+
+/** ElevenLabs Scribe, falling back to Muse Voice Transcribe if it fails or has no key. */
+async function transcribeWithFallback(wav: Buffer, keywords: string[]): Promise<string> {
+  if (!hasElevenLabs()) return museTranscribe(wav, keywords);
+  try {
+    return await elevenLabsTranscribe(wav, keywords);
+  } catch (err) {
+    if (!hasMuse()) throw err;
+    console.warn("[transcribe] ElevenLabs failed, using Muse:", redact((err as Error).message).slice(0, 120));
+    return museTranscribe(wav, keywords);
+  }
+}
+
+/** Speech to text, biased toward the words this session is likely to hear: quest objects and recognized landmarks. */
 async function transcribe(s: ReturnType<typeof getSession>, wav: Buffer): Promise<string> {
   const questWords = s.quest?.steps.flatMap((step) => [step.target, step.destination]) ?? [];
   const keywords = [...new Set([...wakeKeywords(), ...BASE_KEYWORDS, ...questWords, ...s.map.landmarks.map((l) => l.label)].filter(Boolean))].slice(0, 20);
   trackPipeline(s, "transcribe", "start");
+  // Voice gets the uplink first: frame and survey uploads wait until the audio is transcribed.
+  const release = holdVision();
   try {
-    const { value: transcript, ms } = await timed(() => museTranscribe(wav, keywords));
+    const { value: transcript, ms } = await timed(() => transcribeWithFallback(wav, keywords));
     trackPipeline(s, "transcribe", "done", ms);
     return transcript;
   } catch (err) {
     trackPipeline(s, "transcribe", "error", undefined, redact((err as Error).message).slice(0, 80));
     throw err;
+  } finally {
+    release();
   }
 }
 
 const voiceSession = (req: Request) => getSession(String(req.query.sessionId ?? "demo").slice(0, 64));
 
 /**
+ * Hands-free listening, transcribed on the phone (Safari speech recognition). Same wake-phrase
+ * rules as /api/voice/listen, but no audio upload or transcription call.
+ */
+app.post("/api/voice/heard", (req, res) => {
+  const { sessionId, transcript } = req.body as { sessionId?: string; transcript?: string };
+  const heard = transcript?.trim().slice(0, 500) ?? "";
+  if (!sessionId || !heard) {
+    res.status(400).json({ error: "sessionId and transcript are required" });
+    return;
+  }
+  const response = hearUtterance(getSession(sessionId.slice(0, 64)), heard);
+  console.log(`[heard] ${response.heard} on-phone "${heard.slice(0, 80)}"`);
+  res.json(response);
+});
+
+/**
  * Hands-free listening. Body: one utterance as raw mono 16-bit PCM WAV, cut by the phone's
- * voice-activity detector. Muse transcribes it; the session acts only after the wake phrase.
+ * voice-activity detector. ElevenLabs (or Muse) transcribes it; the session acts only after the wake phrase.
  */
 app.post(
   "/api/voice/listen",
   wavBody,
   asyncRoute(async (req, res) => {
     const s = voiceSession(req);
-    if (!hasMuse()) {
-      res.status(503).json({ error: "MODEL_API_KEY not set; type commands instead" });
+    if (!transcribeModel()) {
+      res.status(503).json({ error: "ELEVENLABS_API_KEY or MODEL_API_KEY not set; type commands instead" });
       return;
     }
     const t0 = Date.now();
@@ -234,6 +274,6 @@ app.listen(config.port, config.host, (err?: Error) => {
   console.log(`Sidequest API on http://${config.host}:${config.port}`);
   console.log(
     `  quest agent: ${modelName(questMode(), config.gemini.questModel)} | vision agent: ${modelName(visionMode(), config.gemini.visionModel)} | ` +
-      `transcribe: ${hasMuse() ? config.muse.transcribeModel : "off"} | camera link: ${cameraLinkEnabled() ? config.cameraLink.url : "off"}`,
+      `transcribe: ${transcribeModel() ?? "off"} | camera link: ${cameraLinkEnabled() ? config.cameraLink.url : "off"}`,
   );
 });

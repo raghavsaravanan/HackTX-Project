@@ -39,16 +39,19 @@ export const config = {
     url: (env.CAMERA_LINK_URL ?? "http://127.0.0.1:8000").replace(/\/$/, ""),
     /** Frames older than this are treated as "no camera". */
     maxAgeMs: Number(env.CAMERA_LINK_MAX_AGE_MS ?? 4000),
-    intervalMs: Number(env.CAMERA_LINK_INTERVAL_MS ?? 1200),
-    maxSide: 768,
+    /** Lower rates and smaller frames keep the uplink free for voice on a phone hotspot. */
+    intervalMs: Number(env.CAMERA_LINK_INTERVAL_MS ?? 2500),
+    maxSide: Number(env.CAMERA_LINK_MAX_SIDE ?? 512),
   },
   /** How often the Vision Agent re-surveys the surroundings for the quest map. 0 disables it. */
-  surveyIntervalMs: Number(env.SURVEY_INTERVAL_MS ?? 15000),
+  surveyIntervalMs: Number(env.SURVEY_INTERVAL_MS ?? 60000),
   elevenlabs: {
     apiKey: env.ELEVENLABS_API_KEY ?? "",
     /** Premade voice; override in .env (ElevenLabs voice library). */
     voiceId: env.ELEVENLABS_VOICE_ID ?? "EXAVITQu4vr4xnSDxMaL",
     model: env.ELEVENLABS_MODEL ?? "eleven_flash_v2_5",
+    /** Speech to text for the phone's microphone; Muse Voice Transcribe is the fallback. */
+    sttModel: env.ELEVENLABS_STT_MODEL || "scribe_v2",
   },
   game: {
     /** A single observation at or above this confidence completes a step. */
