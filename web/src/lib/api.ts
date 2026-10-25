@@ -1,12 +1,4 @@
-import type {
-  CommandType,
-  FrameRequest,
-  FrameResponse,
-  ServerEvent,
-  SessionSnapshot,
-  StartQuestRequest,
-  VoiceResponse,
-} from "../../../shared/types.ts";
+import type { AskResponse, ServerEvent, SessionSnapshot, VisionCheck } from "../../../shared/types.ts";
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -19,37 +11,34 @@ async function post<T>(url: string, body: unknown): Promise<T> {
 }
 
 export interface Health {
+  agent: { name: string; wakePhrase: string };
   muse: string;
   transcribe: string;
   vision: string;
+  quest: string;
   gemini: boolean;
+  verifySteps: boolean;
+  cameraLink: { url: string; reachable: boolean; lastFrameAgeMs: number | null } | null;
 }
 
-export interface PresetSummary {
-  id: string;
-  title: string;
-  type: string;
-  steps: number;
+/** The Python camera server's pairing info (proxied by Vite). */
+export interface CameraInfo {
+  phone_url: string;
+  peers: string[];
 }
+
+const getJson = <T,>(url: string) =>
+  fetch(url).then((r) => {
+    if (!r.ok) throw new Error(`${url} failed (${r.status})`);
+    return r.json() as Promise<T>;
+  });
 
 export const api = {
-  health: () => fetch("/api/health").then((r) => r.json() as Promise<Health>),
-  presets: () => fetch("/api/presets").then((r) => r.json() as Promise<PresetSummary[]>),
-  session: (id: string) => fetch(`/api/session/${id}`).then((r) => r.json() as Promise<SessionSnapshot>),
-  frame: (body: FrameRequest) => post<FrameResponse>("/api/frame", body),
-  startQuest: (body: StartQuestRequest) => post<SessionSnapshot>("/api/quest/start", body),
-  command: (sessionId: string, type: CommandType, image?: string) =>
-    post<SessionSnapshot>("/api/command", { sessionId, type, image }),
-  intent: (sessionId: string, text: string) => post<VoiceResponse>("/api/intent", { sessionId, text }),
-  voice: async (sessionId: string, wav: Blob): Promise<VoiceResponse> => {
-    const res = await fetch(`/api/voice?sessionId=${encodeURIComponent(sessionId)}`, {
-      method: "POST",
-      headers: { "Content-Type": "audio/wav" },
-      body: wav,
-    });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? `voice failed (${res.status})`);
-    return res.json() as Promise<VoiceResponse>;
-  },
+  health: () => getJson<Health>("/api/health"),
+  cameraInfo: () => getJson<CameraInfo>("/api/info"),
+  ask: (sessionId: string, text: string, image?: string) => post<AskResponse>("/api/agent/ask", { sessionId, text, image }),
+  verifyMission: (sessionId: string, stepId: string, image?: string) =>
+    post<{ check: VisionCheck; snapshot: SessionSnapshot }>("/api/mission/verify", { sessionId, stepId, image }),
 };
 
 /** Subscribe to session events. Returns an unsubscribe function. EventSource reconnects on its own. */
@@ -62,3 +51,5 @@ export function subscribeEvents(sessionId: string, role: "stage" | "phone", onEv
 export function sessionIdFromUrl(): string {
   return new URLSearchParams(location.search).get("session") ?? "demo";
 }
+
+export const SOURCE_LABEL: Record<string, string> = { gemini: "Gemini Quest Agent", muse: "Muse Spark", system: "system" };

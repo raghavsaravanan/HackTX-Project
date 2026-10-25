@@ -3,32 +3,52 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Phone Camera</title>
+  <title>Sidequest controller</title>
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body class="phone">
   <main>
     <header>
-      <h1>Phone camera</h1>
+      <h1>Sidequest</h1>
       <span class="room">room <code id="room"></code></span>
     </header>
+
+    <button id="start" class="primary start-big">Start</button>
+    <p id="voice-state" class="voice-state" data-mode="idle" role="status" aria-live="polite"></p>
+
+    <section class="quest-card">
+      <h2 id="quest-title">No quest yet</h2>
+      <p id="instruction"></p>
+      <ol id="steps"></ol>
+      <p id="verdict" class="verdict-line" hidden></p>
+      <p id="line" class="narrator-line" hidden></p>
+      <p id="said" class="muted" hidden></p>
+    </section>
 
     <div class="video-wrap">
       <video id="preview" autoplay playsinline muted></video>
     </div>
-
     <p id="status" class="status" data-state="idle">Connecting to server…</p>
 
-    <div class="controls">
-      <button id="start" class="primary">Start camera</button>
-      <button id="flip" disabled>Flip camera</button>
-      <select id="resolution" aria-label="Resolution">
-        <option value="640x480">480p</option>
-        <option value="1280x720" selected>720p</option>
-        <option value="1920x1080">1080p</option>
-      </select>
-    </div>
-    <p class="hint">Keep this tab open and the screen on while streaming.</p>
+    <form id="typed" class="row">
+      <input id="typed-text" placeholder="Or type to the agent" autocomplete="off">
+      <button class="primary" type="submit">Send</button>
+    </form>
+
+    <details class="settings">
+      <summary>Settings</summary>
+      <label class="row"><input type="checkbox" id="listen" checked> Listen for the wake phrase</label>
+      <label class="row"><input type="checkbox" id="speak" checked> Speak on this phone</label>
+      <div class="controls">
+        <button id="flip" type="button" disabled>Flip camera</button>
+        <select id="resolution" aria-label="Resolution">
+          <option value="640x480">480p</option>
+          <option value="1280x720" selected>720p</option>
+          <option value="1920x1080">1080p</option>
+        </select>
+      </div>
+    </details>
+    <p class="hint">Point the back camera at the room and keep this tab open. The screen stays on while the quest runs.</p>
   </main>
   <script type="module" src="/static/js/phone.js"></script>
 </body>

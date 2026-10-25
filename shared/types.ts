@@ -22,6 +22,8 @@ export interface QuestStep {
   instruction: string;
   /** What the verifier looks for to mark the step done. */
   success: string;
+  /** Yes/no question the Vision Agent answers to confirm the step, e.g. "Is the bottle inside the trash can?" */
+  check: string;
 }
 
 export type QuestType = "side" | "boss";
@@ -32,6 +34,61 @@ export interface Quest {
   type: QuestType;
   intro: string;
   steps: QuestStep[];
+  /** Whole-quest question for the final inspection, e.g. "Is the desk clear of clutter?" */
+  goalCheck: string;
+}
+
+// ---------- Vision Agent checks ----------
+
+export type Verdict = "PASS" | "FAIL" | "UNCERTAIN";
+
+export interface VisionCheck {
+  question: string;
+  verdict: Verdict;
+  confidence: number;
+  /** Short, concrete things visible in the frame that justify the verdict. */
+  evidence: string[];
+  /** One spoken-friendly sentence. */
+  summary: string;
+  provider: string;
+  model: string;
+  ms: number;
+  at: number;
+}
+
+// ---------- Missions and the quest map ----------
+
+export type MissionStatus = "locked" | "active" | "verifying" | "retry" | "done" | "skipped";
+
+/** Live status of one quest step. */
+export interface MissionState {
+  stepId: string;
+  status: MissionStatus;
+  /** Map landmark where this mission happens (the destination for drop/place). */
+  landmarkId: string | null;
+  note: string;
+  attempts: number;
+  lastCheck: VisionCheck | null;
+}
+
+/** A named place or object on the quest map. x, y are 0..100; y=100 is nearest the player. */
+export interface MapLandmark {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  seen: boolean;
+  note: string;
+}
+
+export interface QuestMap {
+  /** The Vision Agent's latest description of the surroundings. */
+  setting: string;
+  landmarks: MapLandmark[];
+  /** Landmark id the player is currently at, if known. */
+  playerAt: string | null;
+  goalCheck: VisionCheck | null;
+  updatedAt: number;
 }
 
 export type Distance = "far" | "near" | "within_reach" | "touching";
@@ -75,6 +132,8 @@ export interface SceneObject {
 }
 
 export interface Scene {
+  /** One sentence on the place itself, e.g. "a small bedroom with a desk under a window and an open door on the right". */
+  setting: string;
   objects: SceneObject[];
   hazards: string[];
 }
@@ -114,7 +173,12 @@ export interface SessionSnapshot {
   questEndedAt: number | null;
   stats: PlayerStats;
   narratorName: string;
+  /** Say this, e.g. "Hi Echo", to wake hands-free listening. */
+  wakePhrase: string;
   lastTranscript: string;
+  /** One entry per quest step, same order. Empty without a quest. */
+  missions: MissionState[];
+  map: QuestMap;
 }
 
 export interface VisionTiming {
@@ -164,6 +228,8 @@ export interface CommandRequest {
 
 export type VoiceIntent =
   | { type: "start_quest"; goal: string }
+  /** A question or "I'm done" for the Quest Agent, e.g. "Is the room clean?" */
+  | { type: "ask"; text: string }
   | { type: CommandType }
   | { type: "unknown" };
 
@@ -172,14 +238,63 @@ export interface VoiceResponse {
   intent: VoiceIntent;
 }
 
+/**
+ * What hands-free listening did with one utterance.
+ * asleep: no wake phrase, nothing happened. woke: just the wake phrase. command: acted on.
+ * ignored: heard while awake, but a new quest needs the wake phrase.
+ */
+export interface ListenResponse {
+  transcript: string;
+  heard: "asleep" | "woke" | "command" | "ignored";
+  intent: VoiceIntent | null;
+  /** How long follow-ups need no wake phrase. 0 when asleep. */
+  awakeMs: number;
+}
+
+/** Which model produced a line: a Gemini agent, Muse Spark (fallback brain), or a canned template. */
+export type LineSource = "gemini" | "muse" | "system";
+
+export interface AskRequest {
+  sessionId: string;
+  text: string;
+  /** Optional frame; otherwise the latest camera-link or console frame is used. */
+  image?: string;
+}
+
+export interface AskResponse {
+  reply: string;
+  source: LineSource;
+  check: VisionCheck | null;
+  missionCompleted: boolean;
+  snapshot: SessionSnapshot;
+}
+
+export interface VisionCheckRequest {
+  sessionId: string;
+  question: string;
+  image?: string;
+}
+
+export interface MissionVerifyRequest {
+  sessionId: string;
+  stepId: string;
+  image?: string;
+}
+
+export type PipelineStage = "vision" | "verify" | "plan" | "agent" | "narrate" | "transcribe" | "hint";
+
 // ---------- Server-sent events (/api/session/:id/events) ----------
 
 export type ServerEvent =
   | { type: "snapshot"; snapshot: SessionSnapshot }
-  | { type: "say"; text: string; source: "muse" | "system"; sfx?: Sfx[]; priority?: boolean }
+  | { type: "say"; text: string; source: LineSource; sfx?: Sfx[]; priority?: boolean }
   | { type: "reward"; stepId: string; reward: Reward }
   | { type: "quest_complete"; questId: string; title: string; recap: string; durationMs: number; stats: PlayerStats }
-  | { type: "pipeline"; stage: "vision" | "plan" | "narrate" | "transcribe" | "hint"; status: "start" | "done" | "error"; detail?: string; ms?: number }
+  | { type: "pipeline"; stage: PipelineStage; status: "start" | "done" | "error"; detail?: string; ms?: number }
+  /** A Vision Agent verdict; `stepId` is set when it was checking a mission, "goal" for the final inspection. */
+  | { type: "vision_check"; check: VisionCheck; stepId: string | null }
   /** Stage-only: the latest analyzed frame. */
   | { type: "frame"; image: string; observation: StepObservation | null; guidance: Guidance; timing: VisionTiming | null }
+  /** Phone-only: the same guidance without the image, for spoken cues. */
+  | { type: "guide"; guidance: Guidance }
   | { type: "transcript"; text: string };

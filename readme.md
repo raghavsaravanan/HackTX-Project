@@ -1,12 +1,12 @@
 # Sidequest — HackTX 2026
 
-Everyday tasks become voice-guided quests for blind players. Gemini sees, Muse thinks, you conquer.
+Everyday tasks become voice-guided quests for blind players. Muse hears, Gemini sees and guides, you conquer.
 
 The repo holds two apps that share one `.env`:
 
 | App | Language | What it does | Ports |
 | --- | --- | --- | --- |
-| **Sidequest game** (`server/`, `web/`, `shared/`) | Node / TypeScript | Quest planning, per-frame guidance, XP, narration, projector stage view | API `8787`, web `5173` |
+| **Sidequest game** (`server/`, `web/`, `shared/`) | Node / TypeScript | Quest planning, per-frame guidance, XP, narration, the laptop hub | API `8787`, hub `5173` (laptop only) |
 | **Phone camera link** (`app/`, `static/`) | Python / FastAPI | Streams the phone camera to the laptop over WebRTC and buffers frames for a vision model | phone `8443` (HTTPS), viewer `8000` |
 
 ```bash
@@ -19,33 +19,77 @@ cp .env.example .env   # one file configures both apps; blank keys fall back to 
 
 ```bash
 npm install
-npm run dev            # API on :8787, web on https://localhost:5173
+npm run dev            # game API on :8787, laptop hub on http://localhost:5173
+.venv/bin/python run.py   # phone camera server (setup below)
 ```
 
-- **Stage (projector):** `https://localhost:5173/stage?session=demo`
-- **Console (phone / test harness):** `https://<laptop-LAN-IP>:5173/console?session=demo`. Accept the self-signed cert on the phone; HTTPS is required for camera and mic.
-- Laptop-only (no phone): `HTTP=1 npm run dev` serves plain HTTP.
-- Without any keys, everything runs on scripted mock vision so you can rehearse the full demo.
+**One laptop link: `http://localhost:5173`.** It has four tabs:
 
-### Models
+| Tab | What it shows |
+| --- | --- |
+| Connect phone | The QR code that opens the phone controller, plus a pairing checklist |
+| Quest | The projector view: what the AI sees, the quest, the quest map, Vision Agent verdicts, XP, subtitles |
+| Live camera | The full-rate WebRTC video from the phone (the camera server's viewer, proxied) |
+| APIs | Which service does which job, and the model each one is using right now |
+
+The hub proxies the camera server (`/viewer`, `/ws/*`, `/api/qr.svg`, `/api/info`, `/api/frames*`) and the game API (`/api/*`), so nothing else needs opening. Without any keys, everything runs on scripted mock vision so you can rehearse the demo.
+
+### The journey
+
+The phone is the controller, and it is hands-free. The agent is called **Echo** (`AGENT_NAME`).
+
+1. Start both apps and open `http://localhost:5173` on the laptop.
+2. Scan the QR code on the Connect phone tab. Accept the certificate warning once.
+3. Tap **Start** on the phone, the only tap needed. It turns on the camera and the microphone and keeps the screen awake. The hub switches to the Quest tab when frames arrive.
+4. Say **“Hi Echo, help me tidy my desk.”** The Vision Agent surveys the room, and the Quest Agent builds a quest from what it sees and speaks the first step. “Hi Echo” on its own gets a chime and a “Yes?”.
+5. Follow the voice. Beeps speed up and pan toward the target. Say “I'm done” after a step, or ask “is the room clean?” or “where are my headphones?”.
+6. For 20 seconds after the wake phrase or a reply (`AWAKE_MS`), follow-ups need no wake phrase. Starting a new quest always needs it, so nearby chatter can't replace the quest.
+
+How listening works: the phone runs a small voice detector, so only speech is sent, one utterance at a time, while the phone's own voice is muted from the mic. Each utterance goes to Muse Voice Transcribe with the agent's name and the quest's objects as keywords. The server checks for the wake phrase and drops everything else. There is a type box for loud rooms; typed text needs no wake phrase. The scripted presets (`POST /api/quest/start` with a `presetId`) remain a demo safety net.
+
+### Agents and models
 
 | Job | Model | Where |
 | --- | --- | --- |
-| Voice commands | Muse Voice Transcribe (`/v1/asr/transcribe`, 16 kHz WAV) | `server/providers/muse.ts` |
-| Quest planning, narration, hints | Muse Spark (`muse-spark-1.3`, JSON-schema output) | `server/brain.ts`, `server/prompts.ts` |
-| Per-frame vision + scene scan | Gemini (`GEMINI_MODEL`, default `gemini-4-argon`) | `server/vision.ts`, `server/providers/gemini.ts` |
-| Vision fallback | Muse Spark with images, used automatically if Gemini fails | `server/vision.ts` |
-| Narrator voice | Browser `speechSynthesis` | `web/src/lib/speech.ts` |
+| Speech to text | Muse Voice Transcribe (`/v1/asr/transcribe`, 16 kHz WAV), with the agent's name and the quest's objects as keywords | `server/providers/muse.ts`, `server/index.ts` |
+| Wake phrase (“Hi Echo”) and the awake window | No model; a pattern match on each transcript | `server/wake.ts`, `hearUtterance` in `server/session.ts` |
+| **Quest Agent**: plans quests (each mission gets a vision `check`), narrates step by step, gives hints, answers questions, asks the Vision Agent to look, updates mission statuses and the quest map | Gemini (`GEMINI_QUEST_MODEL`, else `GEMINI_MODEL`) | `server/questAgent.ts`, `server/llm.ts`, `server/prompts.ts` |
+| **Vision Agent**: per-frame step observations, scene scans, and yes/no checks answered `PASS` / `FAIL` / `UNCERTAIN` with evidence | Gemini (`GEMINI_VISION_MODEL`, else `GEMINI_MODEL`) | `server/vision.ts` |
+| Fallback brain and eyes | Muse Spark (`muse-spark-1.3`), used automatically when Gemini is missing or fails (quota, overload, timeout) | `server/llm.ts`, `server/vision.ts` |
+| Narrator voice and directional beeps | The phone's `speechSynthesis` and Web Audio | `static/js/voice.js` |
 
-### Contract for the phone app
+How the agents work together:
 
-All types live in `shared/types.ts`. The loop:
+- **Verified progress.** When the frame loop thinks a step is done, the mission turns `verifying` and the Vision Agent answers that mission's `check`. `PASS` awards XP and advances. `FAIL` or `UNCERTAIN` sends the verdict and evidence back to the Quest Agent, which marks the mission `retry` and speaks a correction. A PASS/FAIL below 0.55 confidence counts as UNCERTAIN. Set `VERIFY_STEPS=0` to trust the frame loop alone.
+- **Questions.** "Is the room clean?", "Where is the trash can?", or "I'm done" become an `ask` intent. The Quest Agent either answers from quest state or names one yes/no question for the Vision Agent, then reacts to the verdict. Only a Vision Agent `PASS` can complete a mission.
+- **Recognized surroundings, not presets.** Every few seconds (`SURVEY_INTERVAL_MS`) the Vision Agent surveys the live camera frame: a one-sentence description of the place plus every object it can actually see. These become the map's landmarks and the Quest Agent's picture of the room. Planned quests may only use objects the camera saw (or ones the player names). The scripted presets remain as a demo safety net, but their map is also filled from what the camera sees.
+- **Quest map.** The stage shows recognized objects as landmarks, missions as numbered nodes on a route, and where the player is. Nodes update as the camera spots objects and as the Quest Agent pins notes. Tap a mission to re-verify it, or a landmark to ask where it is. After victory the Vision Agent runs the quest's `goalCheck` once and pins the verdict on the map.
+- **One vision call at a time.** Frames are analyzed about once a second, and a surroundings survey runs every 15 seconds. A Gemini quota error (429) pauses Gemini for 30 seconds and Muse Spark takes over, so vision traffic can't crowd out transcription.
 
-1. `POST /api/quest/start` with `{ sessionId, presetId }` or `{ sessionId, goal, image }`.
-2. Every ~600 ms, `POST /api/frame` with `{ sessionId, seq, image }` (512px JPEG data URL). Up to 2 requests in flight; ignore responses older than the newest one. `FrameLoop` in `web/src/lib/camera.ts` does this.
-3. Drive audio from `response.guidance`: `phase` (scan / aim / approach / reach / verify), `pan` (-1..1), `proximity` (0..1), `say` (throttle it). `GuidanceCues` in `web/src/lib/cues.ts` is a working reference.
-4. Subscribe to `GET /api/session/:id/events?role=phone` (server-sent events). Speak every `say` event and play `sfx` on `reward` events.
-5. Voice: record push-to-talk with `WavRecorder`, `POST /api/voice?sessionId=` (raw WAV body), then dispatch the returned `intent` (`start_quest` → step 1; anything else → `POST /api/command`).
+**API keys stay on the server.** They are read from `.env` (gitignored) by the Node API only, sent in headers (never URLs), and scrubbed from logs and error responses. Vite exposes nothing to the browser. In dev the API binds to `127.0.0.1` behind the Vite proxy, so other devices on the network can't spend your quota.
+
+### Which API is used where
+
+The phone only talks to the camera server (port 8443). That server holds no keys; it forwards game traffic to the Node API on `127.0.0.1:8787`, which is the only process that calls out. Keys are read from `.env`, sent in headers, and scrubbed from logs and error responses.
+
+| What happens | External API | Called from |
+| --- | --- | --- |
+| Speech → text | Meta **Muse Voice Transcribe** `POST /v1/asr/transcribe` | `server/providers/muse.ts` |
+| Planning, narration, hints, answers | Google **Gemini** (`GEMINI_QUEST_API_KEY`, `GEMINI_QUEST_MODEL`) | `server/questAgent.ts` via `server/llm.ts` |
+| Seeing frames, surveying the room, PASS/FAIL/UNCERTAIN checks | Google **Gemini** (`GEMINI_VISION_API_KEY`, `GEMINI_VISION_MODEL`) | `server/vision.ts` |
+| Either agent, when its Gemini key is missing, over quota, or unreachable | Meta **Muse Spark** `POST /v1/chat/completions` (`MODEL_API_KEY`) | `server/llm.ts`, `server/vision.ts` |
+| Optional “ask the model” box on the laptop viewer | Local **Llama** (Ollama) | `app/llama.py` |
+
+The phone's own calls, all on the camera server:
+
+| Phone does | Camera server | Node API behind it |
+| --- | --- | --- |
+| Each spoken utterance (16 kHz mono WAV) | `POST /api/game/voice` | `POST /api/voice/listen` → transcribe, then act only after the wake phrase |
+| Type instead | `POST /api/game/text` | `POST /api/say` → act on the text, no wake phrase |
+| Listen for narration, verdicts, the quest | `GET /api/game/events` | `GET /api/session/:id/events?role=phone` |
+| One JPEG a second | `WS /ws/frames` | polled from `GET /api/frames/latest` on the camera server |
+
+`POST /api/frame` still accepts frames pushed directly at the Node API, and `POST /api/vision/check` plus `POST /api/mission/verify` ask the Vision Agent on demand. The hub's Quest tab uses the event stream with `?role=stage`.
 
 The server owns quest progress, step completion, XP, combos, levels, hints, and narration, so the phone and stage always agree.
 
@@ -54,7 +98,7 @@ The server owns quest progress, step completion, XP, combos, levels, hints, and 
 - Stage the desk with the preset objects: water bottle, trash can, book, backpack.
 - Use the `desk` preset as the safety net if live planning misbehaves.
 - Run the demo on a phone hotspot, not venue Wi-Fi.
-- Click "Enable stage sound" on the projector so the audience hears rewards.
+- Click "Enable stage sound" on the Quest tab so the audience hears rewards.
 
 ---
 

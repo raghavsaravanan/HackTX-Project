@@ -1,11 +1,21 @@
 import { useEffect, useState } from "react";
-import type { Box, Guidance, Reward, ServerEvent, SessionSnapshot, StepObservation, VisionTiming } from "../../../shared/types.ts";
-import { api, sessionIdFromUrl, type Health } from "../lib/api.ts";
+import type {
+  Box,
+  Guidance,
+  PipelineStage,
+  Reward,
+  ServerEvent,
+  SessionSnapshot,
+  StepObservation,
+  VisionCheck,
+  VisionTiming,
+} from "../../../shared/types.ts";
+import { CheckDetail, QuestMap } from "../lib/QuestMap.tsx";
+import { SOURCE_LABEL, sessionIdFromUrl, type Health } from "../lib/api.ts";
 import { playSfx, unlockAudio } from "../lib/sfx.ts";
 import { narrator } from "../lib/speech.ts";
 import { useSession } from "../lib/useSession.ts";
 
-type PipelineStage = "transcribe" | "vision" | "plan" | "narrate" | "hint";
 type PipelineState = Record<PipelineStage, { status: "idle" | "start" | "done" | "error"; ms?: number; detail?: string }>;
 
 interface Frame {
@@ -31,14 +41,15 @@ interface QuestDone {
 const initialPipeline: PipelineState = {
   transcribe: { status: "idle" },
   vision: { status: "idle" },
+  verify: { status: "idle" },
   plan: { status: "idle" },
+  agent: { status: "idle" },
   narrate: { status: "idle" },
   hint: { status: "idle" },
 };
 
-export function Stage() {
+export function Stage({ health }: { health: Health | null }) {
   const sessionId = sessionIdFromUrl();
-  const [health, setHealth] = useState<Health | null>(null);
   const [frame, setFrame] = useState<Frame | null>(null);
   const [subtitle, setSubtitle] = useState<{ text: string; source: string; key: number } | null>(null);
   const [transcript, setTranscript] = useState("");
@@ -46,11 +57,11 @@ export function Stage() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [levelUp, setLevelUp] = useState<number | null>(null);
   const [questDone, setQuestDone] = useState<QuestDone | null>(null);
+  const [lastCheck, setLastCheck] = useState<VisionCheck | null>(null);
   const [sound, setSound] = useState({ sfx: false, voice: false });
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setHealth(null));
     const t = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(t);
   }, []);
@@ -71,6 +82,9 @@ export function Stage() {
         break;
       case "transcript":
         setTranscript(e.text);
+        break;
+      case "vision_check":
+        setLastCheck(e.check);
         break;
       case "pipeline":
         setPipeline((p) => ({ ...p, [e.stage]: { status: e.status, ms: e.ms ?? p[e.stage].ms, detail: e.detail } }));
@@ -104,10 +118,9 @@ export function Stage() {
   return (
     <div className="stage">
       <header className="stage-header">
-        <div className="brand">
-          <span className="brand-mark">SIDEQUEST</span>
-          <span className="brand-tag">Gemini sees. Muse thinks. You conquer.</span>
-        </div>
+        <span className="brand-tag">
+          Say “{snapshot?.wakePhrase ?? "Hi Echo"}, …” on the phone. Muse hears, Gemini sees and guides.
+        </span>
         <div className="header-right">
           <StatusPill status={snapshot?.status ?? "idle"} />
           {!sound.sfx ? (
@@ -127,6 +140,8 @@ export function Stage() {
         <CameraPanel frame={frame} />
         <aside className="stage-side">
           <QuestPanel snapshot={snapshot} now={now} />
+          <QuestMap snapshot={snapshot} sessionId={sessionId} />
+          <VisionCheckPanel check={lastCheck} />
           <PlayerPanel snapshot={snapshot} />
           <PipelinePanel pipeline={pipeline} health={health} />
         </aside>
@@ -136,7 +151,7 @@ export function Stage() {
         {transcript && <div className="you-said">Player: “{transcript}”</div>}
         <div className="subtitle-speaker">
           {snapshot?.narratorName ?? "Sir Echo"}
-          <span className="subtitle-source">{subtitle?.source === "muse" ? "Muse Spark" : "system"}</span>
+          <span className="subtitle-source">{SOURCE_LABEL[subtitle?.source ?? "system"]}</span>
         </div>
         <div key={subtitle?.key} className="subtitle-text">
           {subtitle?.text ?? "Awaiting a hero..."}
@@ -282,7 +297,7 @@ function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: 
     return (
       <section className="card">
         <div className="panel-title">Quest</div>
-        <p className="muted">Say a goal like “help me clean my desk” to begin.</p>
+        <p className="muted">On the phone, say “{snapshot?.wakePhrase ?? "Hi Echo"}, help me clean my desk” to begin.</p>
       </section>
     );
   }
@@ -298,13 +313,17 @@ function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: 
       <ol className="steps">
         {quest.steps.map((step, i) => {
           const state = i < snapshot.stepIndex || snapshot.status === "complete" ? "done" : i === snapshot.stepIndex ? "current" : "todo";
+          const mission = snapshot.missions[i]?.status;
           return (
-            <li key={step.id} className={`step step-${state}`}>
+            <li key={step.id} className={`step step-${state} ${mission ? `mission-row-${mission}` : ""}`}>
               <span className="step-icon">{state === "done" ? "✓" : i + 1}</span>
               <span className="step-body">
                 <span className="step-action">{step.action}</span> {step.target}
                 {step.destination && <span className="step-dest"> → {step.destination}</span>}
               </span>
+              {mission === "verifying" && <span className="step-flag">checking</span>}
+              {mission === "retry" && <span className="step-flag step-flag-retry">retry</span>}
+              {mission === "skipped" && <span className="step-flag">skipped</span>}
               {state === "current" && snapshot.status === "active" && <span className="step-timer">{formatDuration(stepElapsed)}</span>}
             </li>
           );
@@ -347,10 +366,12 @@ function PlayerPanel({ snapshot }: { snapshot: SessionSnapshot | null }) {
 function PipelinePanel({ pipeline, health }: { pipeline: PipelineState; health: Health | null }) {
   const rows: { key: PipelineStage; verb: string; model: string }[] = [
     { key: "transcribe", verb: "Hear", model: health?.transcribe ?? "Muse Voice Transcribe" },
-    { key: "vision", verb: "See", model: health?.vision ?? "Gemini" },
-    { key: "plan", verb: "Plan", model: health?.muse ?? "Muse Spark" },
-    { key: "narrate", verb: "Narrate", model: health?.muse ?? "Muse Spark" },
-    { key: "hint", verb: "Hint", model: health?.muse ?? "Muse Spark" },
+    { key: "vision", verb: "See", model: health?.vision ?? "Gemini Vision Agent" },
+    { key: "verify", verb: "Verify", model: health?.vision ?? "Gemini Vision Agent" },
+    { key: "plan", verb: "Plan", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "agent", verb: "Answer", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "narrate", verb: "Narrate", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "hint", verb: "Hint", model: health?.quest ?? "Gemini Quest Agent" },
   ];
   return (
     <section className="card">
@@ -368,6 +389,22 @@ function PipelinePanel({ pipeline, health }: { pipeline: PipelineState; health: 
           );
         })}
       </ul>
+    </section>
+  );
+}
+
+function VisionCheckPanel({ check }: { check: VisionCheck | null }) {
+  return (
+    <section className="card">
+      <div className="panel-title">Vision Agent</div>
+      {check ? (
+        <>
+          <div className="check-question">“{check.question}”</div>
+          <CheckDetail check={check} />
+        </>
+      ) : (
+        <p className="muted">Ask “Is the room clean?” or tap a mission on the map to run a check.</p>
+      )}
     </section>
   );
 }

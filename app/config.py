@@ -42,6 +42,10 @@ class Settings:
     llama_max_tokens: int = _int("LLAMA_MAX_TOKENS", 512)
     llama_timeout: float = _float("LLAMA_TIMEOUT", 120.0)
 
+    # Sidequest game API (Node, loopback only). The phone page's voice and narration go through here.
+    sidequest_api_url: str = os.getenv("SIDEQUEST_API_URL", f"http://127.0.0.1:{_int('API_PORT', 8787)}").rstrip("/")
+    sidequest_session: str = os.getenv("SIDEQUEST_SESSION", "demo")
+
     @property
     def cert_file(self) -> Path:
         return self.cert_dir / "cert.pem"

@@ -74,4 +74,29 @@ body.phone .video-wrap { aspect-ratio: 3 / 4; }
 body.phone .status { margin: 12px 0; border-radius: 10px; }
 body.phone .controls { display: flex; gap: 8px; flex-wrap: wrap; }
 body.phone .controls button { flex: 1; padding: 12px; }
+.quest-card { margin-top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.quest-card h2 { font-size: 18px; margin: 8px 0; }
+#instruction { font-size: 18px; margin: 0 0 8px; }
+#steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+#steps li { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); font-size: 15px; }
+#steps li[data-status="active"], #steps li[data-status="verifying"], #steps li[data-status="retry"] { border-color: var(--accent); }
+#steps li[data-status="done"] { opacity: 0.6; }
+#steps li[data-status="retry"] { border-color: var(--error); }
+.verdict-line { margin: 8px 0 0; font-weight: 700; }
+.verdict-line[data-verdict="PASS"] { color: var(--ok); }
+.verdict-line[data-verdict="FAIL"] { color: var(--error); }
+.verdict-line[data-verdict="UNCERTAIN"] { color: var(--warn); }
+#typed { gap: 8px; margin-top: 12px; }
+#typed input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.quest-card [hidden] { display: none; }
+.start-big { width: 100%; padding: 20px; font-size: 20px; font-weight: 700; }
+.voice-state { margin: 12px 0 0; padding: 14px 16px; border-radius: 12px; font-size: 18px; font-weight: 600; background: var(--panel); border: 1px solid var(--border); }
+.voice-state[data-mode="asleep"] { color: var(--muted); }
+.voice-state[data-mode="hearing"] { border-color: var(--warn); color: var(--warn); }
+.voice-state[data-mode="busy"] { border-color: var(--accent); color: var(--accent); }
+.voice-state[data-mode="awake"] { border-color: var(--ok); color: var(--ok); }
+.narrator-line { font-size: 17px; margin: 8px 0; padding: 10px 12px; border-radius: 10px; background: var(--bg); border: 1px solid var(--border); }
+.settings { margin-top: 12px; color: var(--muted); }
+.settings summary { cursor: pointer; padding: 6px 0; }
+body.phone .quest-card + .video-wrap { margin-top: 14px; aspect-ratio: 4 / 3; }
 .hint { color: var(--muted); font-size: 13px; }

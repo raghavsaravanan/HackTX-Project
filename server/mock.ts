@@ -53,6 +53,7 @@ export function mockObservation(step: QuestStep, tick: number): StepObservation 
 }
 
 export const MOCK_SCENE: Scene = {
+  setting: "Mock vision: a desk with a laptop, a chair in front of it",
   objects: [
     { label: "water bottle", box: box(0.3, 0.55, 0.08, 0.2), note: "on the desk, left of the laptop" },
     { label: "laptop", box: box(0.55, 0.5, 0.3, 0.2), note: "center of the desk" },

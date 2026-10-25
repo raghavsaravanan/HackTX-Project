@@ -73,12 +73,13 @@ def test_signaling_replaces_viewer_mdns_hosts_with_lan_ip(monkeypatch):
 
 
 def test_relay_forwards_phone_frames_to_viewer():
-    client = TestClient(app)
     frame = _jpeg(64, 48)
-    with client.websocket_connect("/ws/relay/r1?role=viewer") as viewer:
-        with client.websocket_connect("/ws/relay/r1?role=sender") as phone:
-            phone.send_bytes(frame)
-            assert viewer.receive_bytes() == frame
+    # One shared event loop: the relay sends to the viewer from the phone's handler task.
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/relay/r1?role=viewer") as viewer:
+            with client.websocket_connect("/ws/relay/r1?role=sender") as phone:
+                phone.send_bytes(frame)
+                assert viewer.receive_bytes() == frame
 
 
 def test_frame_ingest_and_latest_endpoint():
@@ -91,6 +92,10 @@ def test_frame_ingest_and_latest_endpoint():
     assert body["frame_id"] == ack["frame_id"]
     assert base64.b64decode(body["base64"])[:2] == b"\xff\xd8"
     assert client.get("/api/frames/latest.jpg").headers["content-type"] == "image/jpeg"
+
+    small = client.get("/api/frames/latest", params={"max_side": 640}).json()
+    assert small["frame_id"] == ack["frame_id"] and (small["width"], small["height"]) == (640, 360)
+    assert Image.open(io.BytesIO(base64.b64decode(small["base64"]))).size == (640, 360)
 
 
 def test_analyze_sends_openai_style_request(monkeypatch):
@@ -118,3 +123,63 @@ def test_analyze_sends_openai_style_request(monkeypatch):
     user = seen["body"]["messages"][-1]["content"]
     assert user[0] == {"type": "text", "text": "What is it?"}
     assert user[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def _mock_game_api(monkeypatch, handler):
+    import httpx
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+
+
+def test_game_voice_forwards_wav_to_sidequest(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = request.content
+        seen["type"] = request.headers["content-type"]
+        return httpx.Response(200, json={"transcript": "is the room clean", "intent": {"type": "ask", "text": "is the room clean"}})
+
+    _mock_game_api(monkeypatch, handler)
+    res = TestClient(app).post("/api/game/voice?session=demo", content=b"RIFFfakewav", headers={"Content-Type": "audio/wav"})
+    assert res.status_code == 200 and res.json()["intent"]["type"] == "ask"
+    assert seen["url"].endswith("/api/voice/listen?sessionId=demo")
+    assert seen["body"] == b"RIFFfakewav" and seen["type"] == "audio/wav"
+
+
+def test_game_text_forwards_to_sidequest(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json={"transcript": "tidy my desk", "intent": {"type": "start_quest", "goal": "tidy my desk"}})
+
+    _mock_game_api(monkeypatch, handler)
+    res = TestClient(app).post("/api/game/text?session=demo", json={"text": "tidy my desk"})
+    assert res.status_code == 200 and res.json()["intent"]["type"] == "start_quest"
+    assert seen["url"].endswith("/api/say") and "tidy my desk" in seen["body"]
+
+
+def test_game_voice_rejects_bad_session_and_empty_audio():
+    client = TestClient(app)
+    assert client.post("/api/game/voice?session=../etc", content=b"x").status_code == 400
+    assert client.post("/api/game/voice").status_code == 400
+
+
+def test_game_events_relays_server_sent_events(monkeypatch):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/session/demo/events" and request.url.params["role"] == "phone"
+        return httpx.Response(200, content=b'data: {"type":"say","text":"Onward"}\n\n', headers={"Content-Type": "text/event-stream"})
+
+    _mock_game_api(monkeypatch, handler)
+    res = TestClient(app).get("/api/game/events")
+    assert res.headers["content-type"].startswith("text/event-stream")
+    assert '"text":"Onward"' in res.text

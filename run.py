@@ -32,8 +32,10 @@ async def serve() -> None:
         ssl_certfile=str(settings.cert_file),
         ssl_keyfile=str(settings.key_file),
         log_level="info",
+        # Open WebSockets and the phone's narration stream would otherwise hold Ctrl+C forever.
+        timeout_graceful_shutdown=3,
     ))
-    http = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=settings.http_port, log_level="info"))
+    http = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=settings.http_port, log_level="info", timeout_graceful_shutdown=3))
     # Only one server should install signal handlers; let the HTTPS one own Ctrl+C.
     http.install_signal_handlers = lambda: None
     https_task = asyncio.create_task(https.serve())

@@ -46,3 +46,10 @@ export function parseJson<T>(text: string): T {
 }
 
 export const uid = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+
+/** Error text plus the underlying socket code, which `fetch` hides behind "fetch failed". */
+export function errorDetail(err: unknown): string {
+  const e = err as { message?: string; cause?: { code?: string; message?: string } };
+  const code = e.cause?.code || e.cause?.message;
+  return `${e.message ?? "unknown error"}${code ? ` (${code})` : ""}`;
+}

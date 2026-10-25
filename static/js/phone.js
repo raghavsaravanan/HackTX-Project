@@ -2,6 +2,7 @@
 // over a direct WebRTC peer connection, falling back to JPEG frames relayed
 // through the server whenever the direct link isn't connected.
 import { RTC_CONFIG, Signaling, roomFromUrl, setStatus, wsUrl } from "./common.js";
+import { initGameVoice } from "./voice.js";
 
 const preview = document.getElementById("preview");
 const statusEl = document.getElementById("status");
@@ -44,6 +45,7 @@ async function startCamera() {
   preview.srcObject = stream;
   startBtn.textContent = "Restart camera";
   flipBtn.disabled = false;
+  startAnalysis();
   if (pc?.connectionState !== "connected") startRelay();
 
   const track = stream.getVideoTracks()[0];
@@ -120,6 +122,38 @@ function stopRelay() {
   relayWs?.close();
 }
 
+// ------------------------------------------------- frames for the Vision Agent
+// One modest JPEG a second, straight into the camera server's frame buffer, so the
+// agents see the phone without anyone ticking a box on the laptop.
+const ANALYSIS_MS = 1000;
+const analysisCanvas = document.createElement("canvas");
+let analysisWs = null;
+let analysisTimer = null;
+
+function openAnalysis() {
+  analysisWs = new WebSocket(wsUrl("/ws/frames"));
+  analysisWs.onmessage = () => {};
+  analysisWs.onclose = () => {
+    analysisWs = null;
+    if (analysisTimer) setTimeout(() => analysisTimer && !analysisWs && openAnalysis(), 1500);
+  };
+}
+
+function startAnalysis() {
+  if (analysisTimer) return;
+  openAnalysis();
+  analysisTimer = setInterval(() => {
+    if (analysisWs?.readyState !== WebSocket.OPEN || analysisWs.bufferedAmount > 256_000 || !preview.videoWidth) return;
+    const scale = Math.min(1, 640 / Math.max(preview.videoWidth, preview.videoHeight));
+    analysisCanvas.width = Math.round(preview.videoWidth * scale);
+    analysisCanvas.height = Math.round(preview.videoHeight * scale);
+    analysisCanvas.getContext("2d").drawImage(preview, 0, 0, analysisCanvas.width, analysisCanvas.height);
+    analysisCanvas.toBlob((blob) => {
+      if (blob && analysisWs?.readyState === WebSocket.OPEN) blob.arrayBuffer().then((buf) => analysisWs?.send(buf));
+    }, "image/jpeg", 0.6);
+  }, ANALYSIS_MS);
+}
+
 function sendRelayFrame() {
   // Skip frames while the socket is backed up so latency stays low on slow Wi-Fi.
   if (relayWs?.readyState !== WebSocket.OPEN || relayWs.bufferedAmount > 256_000 || !preview.videoWidth) return;
@@ -147,7 +181,7 @@ async function onSignal(msg) {
     case "welcome":
       viewerPresent = msg.peers.includes("viewer");
       if (viewerPresent && stream) await call();
-      else if (!stream) setStatus(statusEl, "Connected to server. Tap “Start camera”.", "idle");
+      else if (!stream) setStatus(statusEl, "Connected to the laptop. Tap Start.", "idle");
       break;
     case "peer-joined":
       viewerPresent = true;
@@ -174,7 +208,6 @@ async function onSignal(msg) {
   }
 }
 
-startBtn.addEventListener("click", startCamera);
 resolutionSel.addEventListener("change", () => stream && startCamera());
 flipBtn.addEventListener("click", () => {
   facingMode = facingMode === "environment" ? "user" : "environment";
@@ -182,3 +215,39 @@ flipBtn.addEventListener("click", () => {
   startCamera();
 });
 document.getElementById("room").textContent = room;
+
+const voice = initGameVoice(
+  {
+    speakToggle: document.getElementById("speak"),
+    listenToggle: document.getElementById("listen"),
+    said: document.getElementById("said"),
+    line: document.getElementById("line"),
+    state: document.getElementById("voice-state"),
+    questTitle: document.getElementById("quest-title"),
+    instruction: document.getElementById("instruction"),
+    steps: document.getElementById("steps"),
+    verdict: document.getElementById("verdict"),
+    typedForm: document.getElementById("typed"),
+    typedInput: document.getElementById("typed-text"),
+  },
+  new URLSearchParams(location.search).get("session"),
+);
+
+// The screen turning off stops the camera and microphone, so hold a wake lock while running.
+let wakeLock = null;
+async function keepScreenOn() {
+  try {
+    wakeLock = await navigator.wakeLock?.request("screen");
+  } catch { /* unsupported or denied; the hint asks to keep the screen on */ }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && stream && wakeLock?.released !== false) keepScreenOn();
+});
+
+// One tap: sound unlocked, camera on, microphone listening for the wake phrase.
+startBtn.addEventListener("click", async () => {
+  voice.unlock();
+  await startCamera();
+  await voice.listen();
+  keepScreenOn();
+});

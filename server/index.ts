@@ -1,41 +1,66 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CommandRequest, FrameRequest, StartQuestRequest, VoiceResponse } from "../shared/types.ts";
-import { parseIntent, planQuest } from "./brain.ts";
-import { config, hasGemini, hasMuse, visionMode } from "./config.ts";
+import type {
+  AskRequest,
+  CommandRequest,
+  FrameRequest,
+  MissionVerifyRequest,
+  StartQuestRequest,
+  VisionCheckRequest,
+  VoiceResponse,
+} from "../shared/types.ts";
+import { cameraLinkEnabled, cameraLinkStatus } from "./cameraLink.ts";
+import { config, hasGemini, hasMuse, questMode, redact, visionMode } from "./config.ts";
 import { PRESETS } from "./presets.ts";
 import { museTranscribe } from "./providers/muse.ts";
+import { parseIntent } from "./questAgent.ts";
+import { wakeKeywords, wakePhrase } from "./wake.ts";
 import {
+  askQuestion,
+  dispatchIntent,
   getSession,
   handleFrame,
-  planningFailed,
+  hearUtterance,
+  planFromGoal,
+  pollCameraLink,
   recordTranscript,
   runCommand,
-  setPlanning,
   snapshot,
   startQuest,
   subscribe,
+  surveySurroundings,
   trackPipeline,
+  verifyMission,
+  visionCheck,
 } from "./session.ts";
-import { scanScene } from "./vision.ts";
-import { timed, uid } from "./util.ts";
+import { errorDetail, timed, uid } from "./util.ts";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 const asyncRoute =
   (fn: (req: Request, res: Response) => Promise<void>) => (req: Request, res: Response, next: NextFunction) =>
     fn(req, res).catch(next);
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    muse: hasMuse() ? config.muse.model : "mock",
-    transcribe: hasMuse() ? config.muse.transcribeModel : "unavailable",
-    vision: visionMode() === "gemini" ? config.gemini.model : visionMode() === "muse" ? config.muse.model : "mock",
-    gemini: hasGemini(),
-  });
-});
+const modelName = (mode: "gemini" | "muse" | "mock", gemini: string) => (mode === "gemini" ? gemini : mode === "muse" ? config.muse.model : "mock");
+
+app.get(
+  "/api/health",
+  asyncRoute(async (_req, res) => {
+    res.json({
+      agent: { name: config.agent.name, wakePhrase: wakePhrase() },
+      muse: hasMuse() ? config.muse.model : "mock",
+      transcribe: hasMuse() ? config.muse.transcribeModel : "unavailable",
+      vision: modelName(visionMode(), config.gemini.visionModel),
+      quest: modelName(questMode(), config.gemini.questModel),
+      gemini: hasGemini(),
+      verifySteps: config.game.verifySteps,
+      cameraLink: cameraLinkEnabled() ? await cameraLinkStatus() : null,
+    });
+  }),
+);
 
 app.get("/api/presets", (_req, res) => {
   res.json(Object.entries(PRESETS).map(([id, p]) => ({ id, title: p.title, type: p.type, steps: p.steps.length })));
@@ -74,31 +99,18 @@ app.post(
         return;
       }
       startQuest(s, { id: uid("q"), ...structuredClone(preset) }, "system");
+      // Presets name their objects up front; place them on the map from what the camera actually sees.
+      void surveySurroundings(s);
       res.json(snapshot(s));
       return;
     }
 
-    if (!body.goal || !body.image) {
-      res.status(400).json({ error: "Provide presetId, or goal plus image" });
+    const planned = body.goal ? await planFromGoal(s, body.goal, body.image) : null;
+    if (!planned) {
+      res.status(400).json({ error: "Provide presetId, or a goal plus a camera frame (start the phone camera first)" });
       return;
     }
-
-    setPlanning(s, body.goal);
-    try {
-      trackPipeline(s, "vision", "start");
-      const { scene, timing } = await scanScene(body.image);
-      trackPipeline(s, "vision", "done", timing.ms, `${scene.objects.length} objects`);
-
-      trackPipeline(s, "plan", "start");
-      const { value: quest, ms } = await timed(() => planQuest(body.goal!, scene));
-      trackPipeline(s, "plan", "done", ms, `${quest.steps.length} steps`);
-
-      startQuest(s, quest, hasMuse() ? "muse" : "system");
-      res.json(snapshot(s));
-    } catch (err) {
-      planningFailed(s, (err as Error).message);
-      throw err;
-    }
+    res.json(planned);
   }),
 );
 
@@ -112,34 +124,108 @@ app.post(
   }),
 );
 
-/** Body: raw mono 16-bit PCM WAV. Returns the transcript plus a parsed intent; the client dispatches it. */
+/** The Quest Agent answers a question, consulting the Vision Agent when it needs to look. */
 app.post(
-  "/api/voice",
-  express.raw({ type: ["audio/wav", "audio/x-wav", "application/octet-stream"], limit: "16mb" }),
+  "/api/agent/ask",
   asyncRoute(async (req, res) => {
-    const s = getSession(String(req.query.sessionId ?? "demo"));
-    if (!hasMuse()) {
-      res.status(503).json({ error: "MODEL_API_KEY not set; use typed commands" });
+    const body = req.body as AskRequest;
+    if (!body.sessionId || !body.text?.trim()) {
+      res.status(400).json({ error: "sessionId and text are required" });
       return;
     }
-    trackPipeline(s, "transcribe", "start");
-    const { value: transcript, ms } = await timed(() =>
-      museTranscribe(req.body as Buffer, ["quest", "skip", "repeat", "backpack", "trash can"]),
-    );
-    trackPipeline(s, "transcribe", "done", ms);
-    recordTranscript(s, transcript);
-    const response: VoiceResponse = { transcript, intent: parseIntent(transcript) };
-    res.json(response);
+    res.json(await askQuestion(getSession(body.sessionId), body.text.trim().slice(0, 500), body.image));
   }),
 );
 
-/** Typed fallback for voice: same intent parsing, no transcription. */
-app.post("/api/intent", (req, res) => {
-  const { sessionId, text } = req.body as { sessionId: string; text: string };
-  recordTranscript(getSession(sessionId), text);
-  const response: VoiceResponse = { transcript: text, intent: parseIntent(text) };
-  res.json(response);
-});
+/** Ask the Vision Agent directly: PASS, FAIL, or UNCERTAIN with evidence. */
+app.post(
+  "/api/vision/check",
+  asyncRoute(async (req, res) => {
+    const body = req.body as VisionCheckRequest;
+    if (!body.sessionId || !body.question?.trim()) {
+      res.status(400).json({ error: "sessionId and question are required" });
+      return;
+    }
+    const check = await visionCheck(getSession(body.sessionId), body.question.trim().slice(0, 300), body.image);
+    if (!check) {
+      res.status(502).json({ error: "Vision Agent unavailable" });
+      return;
+    }
+    res.json(check);
+  }),
+);
+
+/** Re-check one mission's success condition (tapped on the quest map). PASS on the current mission completes it. */
+app.post(
+  "/api/mission/verify",
+  asyncRoute(async (req, res) => {
+    const body = req.body as MissionVerifyRequest;
+    const s = getSession(body.sessionId);
+    const check = await verifyMission(s, body.stepId, body.image);
+    if (!check) {
+      res.status(s.quest ? 502 : 404).json({ error: s.quest ? "Vision Agent unavailable" : "No active quest" });
+      return;
+    }
+    res.json({ check, snapshot: snapshot(s) });
+  }),
+);
+
+const BASE_KEYWORDS = ["quest", "skip", "repeat", "pause", "resume", "done", "check"];
+const wavBody = express.raw({ type: ["audio/wav", "audio/x-wav", "application/octet-stream"], limit: "16mb" });
+
+/** Muse Voice Transcribe, biased toward the words this session is likely to hear: quest objects and recognized landmarks. */
+async function transcribe(s: ReturnType<typeof getSession>, wav: Buffer): Promise<string> {
+  const questWords = s.quest?.steps.flatMap((step) => [step.target, step.destination]) ?? [];
+  const keywords = [...new Set([...wakeKeywords(), ...BASE_KEYWORDS, ...questWords, ...s.map.landmarks.map((l) => l.label)].filter(Boolean))].slice(0, 20);
+  trackPipeline(s, "transcribe", "start");
+  try {
+    const { value: transcript, ms } = await timed(() => museTranscribe(wav, keywords));
+    trackPipeline(s, "transcribe", "done", ms);
+    return transcript;
+  } catch (err) {
+    trackPipeline(s, "transcribe", "error", undefined, redact((err as Error).message).slice(0, 80));
+    throw err;
+  }
+}
+
+const voiceSession = (req: Request) => getSession(String(req.query.sessionId ?? "demo").slice(0, 64));
+
+/**
+ * Hands-free listening. Body: one utterance as raw mono 16-bit PCM WAV, cut by the phone's
+ * voice-activity detector. Muse transcribes it; the session acts only after the wake phrase.
+ */
+app.post(
+  "/api/voice/listen",
+  wavBody,
+  asyncRoute(async (req, res) => {
+    const s = voiceSession(req);
+    if (!hasMuse()) {
+      res.status(503).json({ error: "MODEL_API_KEY not set; type commands instead" });
+      return;
+    }
+    const transcript = await transcribe(s, req.body as Buffer);
+    res.json(hearUtterance(s, transcript));
+  }),
+);
+
+/** Typed fallback for the phone: acted on directly, no wake phrase needed. */
+app.post(
+  "/api/say",
+  asyncRoute(async (req, res) => {
+    const { sessionId, text } = req.body as { sessionId: string; text: string };
+    const said = text?.trim().slice(0, 500) ?? "";
+    if (!sessionId || !said) {
+      res.status(400).json({ error: "sessionId and text are required" });
+      return;
+    }
+    const s = getSession(sessionId);
+    const intent = parseIntent(said);
+    recordTranscript(s, said);
+    const response: VoiceResponse = { transcript: said, intent };
+    res.json(response);
+    void dispatchIntent(s, intent);
+  }),
+);
 
 if (process.env.NODE_ENV === "production") {
   const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist");
@@ -148,15 +234,35 @@ if (process.env.NODE_ENV === "production") {
 }
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  console.error("[api]", err.message);
-  if (!res.headersSent) res.status(500).json({ error: err.message });
+  const detail = redact(errorDetail(err));
+  console.error("[api]", detail);
+  const message = /fetch failed/i.test(err.message) ? "The AI service could not be reached. Try again in a moment." : detail;
+  if (!res.headersSent) res.status(500).json({ error: message });
 });
 
-app.listen(config.port, (err?: Error) => {
+if (cameraLinkEnabled() && config.surveyIntervalMs > 0) {
+  setInterval(() => void surveySurroundings(), config.surveyIntervalMs);
+}
+
+if (cameraLinkEnabled()) {
+  let polling = false;
+  setInterval(() => {
+    if (polling) return;
+    polling = true;
+    void pollCameraLink().finally(() => {
+      polling = false;
+    });
+  }, config.cameraLink.intervalMs);
+}
+
+app.listen(config.port, config.host, (err?: Error) => {
   if (err) {
-    console.error(`Could not listen on port ${config.port}: ${err.message}`);
+    console.error(`Could not listen on ${config.host}:${config.port}: ${err.message}`);
     process.exit(1);
   }
-  console.log(`Sidequest API on http://localhost:${config.port}`);
-  console.log(`  muse: ${hasMuse() ? config.muse.model : "MOCK"} | vision: ${visionMode()}`);
+  console.log(`Sidequest API on http://${config.host}:${config.port}`);
+  console.log(
+    `  quest agent: ${modelName(questMode(), config.gemini.questModel)} | vision agent: ${modelName(visionMode(), config.gemini.visionModel)} | ` +
+      `transcribe: ${hasMuse() ? config.muse.transcribeModel : "off"} | camera link: ${cameraLinkEnabled() ? config.cameraLink.url : "off"}`,
+  );
 });
