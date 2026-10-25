@@ -194,6 +194,29 @@ export interface SessionSnapshot {
   map: QuestMap;
   /** Quests set aside for newer requests, most recent first. Lumi returns to them afterwards. */
   savedQuests: SavedQuestSummary[];
+  /** Sharing a finished quest with a contact through Messages; null when not sharing. */
+  share: ShareState | null;
+}
+
+/**
+ * Sharing a finished quest: offer -> choose a contact (or pick between matches) -> preview -> send.
+ * Nothing is sent until the player explicitly confirms the previewed message.
+ */
+export interface ShareState {
+  stage: "offer" | "choose_contact" | "pick_option" | "confirm" | "sending";
+  task: { title: string; goal: string; steps: string[] };
+  /** Matching contacts to pick from (pick_option). */
+  options: { name: string; handle: string; label: string; kind: "phone" | "email" }[];
+  contactName: string;
+  handle: string;
+  handleKind: "phone" | "email" | "";
+  service: "iMessage" | "SMS" | "";
+  /** Services the laptop's Messages app can use, checked when a contact is chosen. */
+  services: ("iMessage" | "SMS")[];
+  /** The message previewed for confirmation. */
+  message: string;
+  /** The flow quietly ends after this; a stale preview can never be sent. */
+  expiresAt: number;
 }
 
 /** A quest paused because the player asked for something else; it keeps its progress and map. */
@@ -233,6 +256,10 @@ export type VoiceIntent =
   | { type: "ask"; text: string }
   /** Go back to a paused quest; `which` is the player's words for it ("" for the most recent). */
   | { type: "return_to_saved"; which: string }
+  /** A reply while Lumi is offering to share a finished quest (yes/no, a contact name, "send it"). */
+  | { type: "share_reply"; text: string }
+  /** The player says the whole task is done ("I'm done"): wrap it up, congratulate, offer to share. */
+  | { type: "finish_task" }
   | { type: CommandType }
   | { type: "unknown" };
 
@@ -281,6 +308,10 @@ export type PipelineStage = "vision" | "verify" | "plan" | "agent" | "narrate" |
 
 export type ServerEvent =
   | { type: "snapshot"; snapshot: SessionSnapshot }
+  /** Sent once to each phone page: its own id, to compare with `speaker`. */
+  | { type: "hello"; clientId: string }
+  /** Only this phone page speaks and listens (the newest one), so two open pages never talk over each other. */
+  | { type: "speaker"; clientId: string }
   | { type: "say"; id: string; text: string; source: LineSource; sfx?: Sfx[]; priority?: boolean }
   | { type: "reward"; stepId: string; reward: Reward }
   | { type: "quest_complete"; questId: string; title: string; recap: string; durationMs: number; stats: PlayerStats }

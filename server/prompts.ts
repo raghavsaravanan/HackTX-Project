@@ -276,7 +276,7 @@ export const INTERPRET_SCHEMA = {
   type: "object",
   properties: {
     addressed_to_agent: { type: "boolean" },
-    kind: { type: "string", enum: ["new_goal", "return_to_saved", "question", "progress", "correction", "command", "chatter"] },
+    kind: { type: "string", enum: ["new_goal", "return_to_saved", "task_done", "question", "progress", "correction", "command", "chatter"] },
     goal: { type: "string" },
     command: { type: "string", enum: ["none", "repeat", "skip", "pause", "resume", "stop", "describe"] },
   },
@@ -304,7 +304,8 @@ export function interpretPrompt(state: AgentState, utterance: string, wakeHeard:
       "Their latest request always wins: if it differs from the active quest, it is a new_goal even mid-quest (the active quest is paused and saved).",
     "- return_to_saved: they want to go back to a paused quest (\"let's finish the table\", \"go back to what we were doing\").",
     "- question: they ask about the room, an object, the quest, or anything else.",
-    "- progress: they report on the current mission (\"I did it\", \"done\", \"I can't find it\", \"got it\").",
+    "- task_done: they say the whole task is finished or they're done with it (\"I'm done\", \"I'm all done\", \"I finished cleaning the table\", \"that's everything\", \"we're done here\").",
+    "- progress: they report on just the current mission (\"I picked it up\", \"got that one\", \"I can't find it\", \"next\").",
     "- correction: they correct you or change the plan (\"that's not trash\", \"I don't have a cloth\", \"actually let's do the desk instead\").",
     "- command: one of the commands below.",
     "- chatter: not meant for you.",

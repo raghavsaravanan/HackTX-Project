@@ -12,6 +12,7 @@ import type {
   QuestStep,
   SavedQuestSummary,
   Scene,
+  ShareState,
   ServerEvent,
   SessionSnapshot,
   SessionStatus,
@@ -42,6 +43,8 @@ import {
   type Understanding,
 } from "./questAgent.ts";
 import { cloudVoiceEnabled, registerSpeakLine } from "./tts.ts";
+import { messagesAvailable } from "./providers/messages.ts";
+import { SHARE_QUESTION, handleShareReply, shareConsumes, shareOffer } from "./share.ts";
 import { timed, uid } from "./util.ts";
 import { inspect, observeStep, scanScene } from "./vision.ts";
 import { matchWake, wakePhrase } from "./wake.ts";
@@ -86,12 +89,16 @@ interface Session {
   saved: SavedQuest[];
   /** Bumped on every new plan request, so a slower, older plan can't replace a newer one. */
   planToken: number;
+  /** Offering to share a finished quest with a contact through Messages; null otherwise. */
+  share: ShareState | null;
   link: { seq: number; frameId: number; inFlight: boolean };
   /** Hands-free listening: follow-ups need no wake phrase until this time. */
   awakeUntil: number;
   /** The last utterance was the bare wake phrase, so the next one is trusted fully. */
   armed: boolean;
-  subscribers: Set<{ res: Response; role: Role }>;
+  subscribers: Set<{ res: Response; role: Role; clientId: string }>;
+  /** The phone page that speaks and listens; other open phone pages for this session stay quiet. */
+  speakerId: string;
 }
 
 /** Everything needed to pick a paused quest back up where it left off. */
@@ -145,10 +152,12 @@ export function getSession(id: string): Session {
       lastSeen: {},
       saved: [],
       planToken: 0,
+      share: null,
       link: { seq: 0, frameId: -1, inFlight: false },
       awakeUntil: 0,
       armed: false,
       subscribers: new Set(),
+      speakerId: "",
     };
     sessions.set(id, s);
   }
@@ -172,6 +181,7 @@ export function snapshot(s: Session): SessionSnapshot {
     missions: s.missions,
     map: s.map,
     savedQuests: s.saved.map(summarizeSaved),
+    share: s.share,
   };
 }
 
@@ -210,13 +220,25 @@ export function subscribe(s: Session, res: Response, role: Role) {
     "X-Accel-Buffering": "no",
   });
   res.flushHeaders();
-  const sub = { res, role };
+  const sub = { res, role, clientId: uid("ph") };
   s.subscribers.add(sub);
   write(res, { type: "snapshot", snapshot: snapshot(s) });
+  if (role === "phone") {
+    // The newest phone page takes over speaking and listening (e.g. after rescanning the QR code).
+    write(res, { type: "hello", clientId: sub.clientId });
+    s.speakerId = sub.clientId;
+    broadcast(s, { type: "speaker", clientId: s.speakerId }, "phone");
+  }
   const heartbeat = setInterval(() => res.write(": ping\n\n"), 15000);
   res.on("close", () => {
     clearInterval(heartbeat);
     s.subscribers.delete(sub);
+    if (sub.clientId === s.speakerId) {
+      // Hand speaking to the most recent phone page still open.
+      const phones = [...s.subscribers].filter((x) => x.role === "phone");
+      s.speakerId = phones.at(-1)?.clientId ?? "";
+      if (s.speakerId) broadcast(s, { type: "speaker", clientId: s.speakerId }, "phone");
+    }
   });
 }
 
@@ -340,6 +362,7 @@ export function planOverview(steps: QuestStep[]): string {
 
 export function startQuest(s: Session, quest: Quest, source: LineSource, scene: Scene | null = null, goal = "") {
   if (s.quest && s.quest.id !== quest.id) saveCurrentQuest(s);
+  if (s.share?.stage !== "sending") s.share = null;
   if (scene) s.scene = scene;
   s.quest = quest;
   s.status = "active";
@@ -604,7 +627,7 @@ async function revisePlan(s: Session, quest: Quest, change: string, opener: stri
   }
 }
 
-function finishQuest(s: Session, quest: Quest, inspected = false) {
+function finishQuest(s: Session, quest: Quest, inspected = false, saidDone = false) {
   const durationMs = Date.now() - (s.questStartedAt ?? Date.now());
   const { stats, reward } = rewardQuest(s.stats, { type: quest.type, hintsUsed: s.hintsThisQuest });
   s.stats = stats;
@@ -618,19 +641,92 @@ function finishQuest(s: Session, quest: Quest, inspected = false) {
   void narrateTracked(
     s,
     "QUEST_COMPLETE",
-    `The player completed "${quest.title}" (${quest.steps.length} steps) in ${seconds} seconds using ${s.hintsThisQuest} hints, ` +
-      `earning ${reward.xpGained} XP and reaching level ${stats.level}. Give a triumphant two-sentence recap of their deeds.`,
+    saidDone
+      ? `The player just told you they finished "${quest.title}" (goal: ${s.goal || quest.title}), earning ${reward.xpGained} XP and reaching level ${stats.level}. ` +
+          "Congratulate them warmly in two sentences on getting it done. Don't mention step counts or how long it took."
+      : `The player completed "${quest.title}" (${quest.steps.length} steps) in ${seconds} seconds using ${s.hintsThisQuest} hints, ` +
+          `earning ${reward.xpGained} XP and reaching level ${stats.level}. Give a triumphant two-sentence recap of their deeds.`,
     `Quest complete! ${quest.title} is conquered in ${seconds} ${seconds === 1 ? "second" : "seconds"}. You are now level ${stats.level}.`,
   ).then((line) => {
     say(s, line.text, line.source, undefined, true);
     broadcast(s, { type: "quest_complete", questId: quest.id, title: quest.title, recap: line.text, durationMs, stats: s.stats });
     if (!inspected) void finalInspection(s, quest);
+    if (messagesAvailable()) {
+      // Celebrate, then offer to share it. Paused quests wait until the share is done.
+      offerShare(s, quest);
+      return;
+    }
     // Then pick the most recent paused quest back up, unless the player has moved on meanwhile.
     if (s.saved.length) {
       setTimeout(() => {
         if (s.quest?.id === quest.id && s.status === "complete") resumeSaved(s, "", "Now, back to");
       }, 4000);
     }
+  });
+}
+
+// ---------- Finishing on the player's word ----------
+
+/**
+ * The player says the whole task is done: stop what's in progress (speech, checks, plans), mark the
+ * remaining missions done, then celebrate and offer to share. Returns false when no task is running.
+ */
+function finishTaskNow(s: Session): boolean {
+  const quest = s.quest;
+  if (!quest || (s.status !== "active" && s.status !== "paused")) return false;
+  s.planToken++; // drop any plan still in progress
+  s.verifying = false;
+  for (let i = s.stepIndex; i < s.missions.length; i++) setMission(s, i, { status: "done" });
+  s.stepIndex = quest.steps.length;
+  // A priority line cuts off whatever Lumi was saying on the phone right away.
+  say(s, "You're done. Nice work.", "system", undefined, true);
+  finishQuest(s, quest, true, true);
+  return true;
+}
+
+// ---------- Sharing a finished quest ----------
+
+/** Ask whether to share the finished quest with a contact. The reply is handled by `handleShareReply`. */
+function offerShare(s: Session, quest: Quest) {
+  s.share = shareOffer({
+    title: quest.title,
+    goal: s.goal || quest.title,
+    steps: quest.steps.map((st) => st.summary || `${st.action} ${st.target}`),
+  });
+  // The player answers without the wake phrase.
+  s.awakeUntil = Date.now() + config.agent.awakeMs * 3;
+  pushSnapshot(s);
+  say(s, SHARE_QUESTION, "system");
+  const offered = s.share;
+  // If nobody answers, end the offer quietly when it expires.
+  setTimeout(() => {
+    if (s.share && s.share.stage === offered.stage && Date.now() > s.share.expiresAt) endShare(s);
+  }, offered.expiresAt - Date.now() + 500);
+}
+
+/** The share is over (sent, cancelled, or expired): pick a paused quest back up if this one is finished. */
+function endShare(s: Session) {
+  s.share = null;
+  pushSnapshot(s);
+  if (s.status === "complete" && s.saved.length) setTimeout(() => s.status === "complete" && !s.share && resumeSaved(s, "", "Now, back to"), 3000);
+}
+
+async function replyToShare(s: Session, text: string) {
+  const state = s.share;
+  if (!state) return;
+  await handleShareReply(state, text, {
+    say: (line, source = "system") => {
+      s.awakeUntil = Date.now() + config.agent.awakeMs * 3;
+      say(s, line, source, undefined, true);
+    },
+    update: (next) => {
+      if (!next) {
+        endShare(s);
+        return;
+      }
+      s.share = next;
+      pushSnapshot(s);
+    },
   });
 }
 
@@ -1002,6 +1098,19 @@ export async function hearUtterance(s: Session, transcript: string, typed = fals
     return { transcript, heard: "woke", intent: null, awakeMs: config.agent.awakeMs };
   }
   const text = rest || transcript.trim();
+  // While sharing a finished quest, replies (yes, a name, "send it") go to the share first.
+  if (s.share && text) {
+    if (shareConsumes(s.share, text)) {
+      const intent: VoiceIntent = { type: "share_reply", text };
+      console.log(`[understood] share_reply from "${text.slice(0, 80)}"`);
+      s.awakeUntil = Date.now() + config.agent.awakeMs * 3;
+      recordTranscript(s, text);
+      void dispatchIntent(s, intent);
+      return { transcript, heard: "command", intent, awakeMs: config.agent.awakeMs };
+    }
+    // Not a reply to the share: the player's new request wins and the share is dropped (nothing was sent).
+    if (s.share.stage !== "sending") endShare(s);
+  }
   // Unprompted fragments ("200", "in a") aren't worth a model call.
   if (!text || (!awake && text.split(/\s+/).length < 3)) return ignore();
 
@@ -1041,6 +1150,8 @@ function intentFrom(s: Session, u: Understanding, text: string, trusted: boolean
       return { type: "start_quest", goal: u.goal || text };
     case "return_to_saved":
       return s.saved.length ? { type: "return_to_saved", which: u.goal } : { type: "ask", text };
+    case "task_done":
+      return { type: "finish_task" };
     default:
       return { type: "ask", text };
   }
@@ -1068,6 +1179,12 @@ export async function dispatchIntent(s: Session, intent: VoiceIntent): Promise<v
         return;
       case "return_to_saved":
         if (!resumeSaved(s, intent.which)) say(s, "There's nothing paused right now. What would you like to do?", "system", undefined, true);
+        return;
+      case "share_reply":
+        await replyToShare(s, intent.text);
+        return;
+      case "finish_task":
+        if (!finishTaskNow(s)) await askQuestion(s, s.lastTranscript || "I'm done");
         return;
       case "unknown":
         say(s, `I did not catch that. Say ${wakePhrase()} and try again.`, "system", undefined, true);

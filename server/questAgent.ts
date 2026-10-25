@@ -169,7 +169,7 @@ export function reactToVerdict(state: AgentState, trigger: string, check: Vision
 
 export interface Understanding {
   addressed: boolean;
-  kind: "new_goal" | "return_to_saved" | "question" | "progress" | "correction" | "command" | "chatter";
+  kind: "new_goal" | "return_to_saved" | "task_done" | "question" | "progress" | "correction" | "command" | "chatter";
   goal: string;
   command: CommandType | "none";
 }
@@ -214,6 +214,7 @@ export function quickCommand(transcript: string): VoiceIntent | null {
 }
 
 const COMMANDS: [RegExp, VoiceIntent][] = [
+  [/\b(i'?m (all )?done|all done|i'?m finished|we'?re done|i('?ve| have) finished( it)?|done with (the|this|my) (task|quest)|finished (the|this|my) (task|quest))\b/i, { type: "finish_task" }],
   [/\b(repeat|say (that|it) again|what (was|did you say))\b/i, { type: "repeat" }],
   [/\b(skip|next step)\b/i, { type: "skip" }],
   [/\b(pause|hold on|wait)\b/i, { type: "pause" }],

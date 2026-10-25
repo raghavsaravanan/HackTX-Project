@@ -53,6 +53,17 @@ export const config = {
     /** Quest planning runs once per quest, so it may think harder. */
     planReasoningEffort: env.OPENAI_PLAN_REASONING_EFFORT || env.OPENAI_REASONING_EFFORT || "low",
   },
+  share: {
+    /** Offer to share a finished quest through the laptop's Messages app (macOS only). SHARE_ENABLED=0 turns it off. */
+    enabled: env.SHARE_ENABLED !== "0",
+    /** Optional quick contacts, "Mom=+15551234567; Alex=alex@icloud.com"; otherwise the Mac's Contacts app is searched. */
+    contacts: env.SHARE_CONTACTS ?? "",
+    /**
+     * The only recipient Lumi may message, "Name=+15551234567" (or just the number). When set, Lumi skips
+     * choosing a contact, never searches Contacts, and refuses to send anywhere else.
+     */
+    onlyTo: env.SHARE_ONLY_TO?.trim() ?? "",
+  },
   visionProvider: (env.VISION_PROVIDER ?? "gemini") as Provider,
   questProvider: (env.QUEST_AGENT_PROVIDER ?? "gemini") as Provider,
   cameraLink: {

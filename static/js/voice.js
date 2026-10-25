@@ -103,6 +103,19 @@ class Listener {
   }
 }
 
+/** Spellings speech recognition produces for agent names (mirrors server/wake.ts). */
+const WAKE_SOUND_ALIKES = {
+  lumi: ["lumie", "lumy", "lumee", "loomi", "loomie", "loomy", "lummy", "lumia", "lu me", "lou me", "loo me", "lew me"],
+  echo: ["eko", "ekko", "ecco", "eco", "hecho"],
+};
+
+/** "Hi Lumi" (or a recognized spelling) anywhere in a transcript, greeting included. */
+function wakePattern(wakePhrase) {
+  const name = wakePhrase.replace(/^(hi|hey)\s+/i, "").trim().toLowerCase();
+  const names = [name, ...(WAKE_SOUND_ALIKES[name] ?? [])].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  return new RegExp(`\\b(?:hi|hey|hello|okay|ok)[\\s,.!]*(?:${names})\\b`, "i");
+}
+
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // Errors that mean on-phone recognition will never work here; fall back to recording audio.
 const FATAL_SPEECH_ERRORS = new Set(["service-not-allowed", "language-not-supported", "audio-capture"]);
@@ -116,8 +129,10 @@ const MAX_NETWORK_ERRORS = 3;
  * its own narration. If iOS revokes permission (e.g. after the screen locked), it waits for a tap.
  */
 class BrowserListener {
-  constructor({ onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap }) {
-    Object.assign(this, { onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap });
+  constructor({ onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap, wakeIndex, onBargeIn }) {
+    Object.assign(this, { onText, onSpeechStart, onSpeechEnd, isMuted, onFatal, onNeedTap, wakeIndex, onBargeIn });
+    /** The player said the wake phrase over Lumi: this utterance counts even though Lumi was talking. */
+    this.barged = false;
     this.enabled = true;
     this.rec = null;
     this.active = false;
@@ -148,7 +163,7 @@ class BrowserListener {
     };
     rec.onresult = (e) => {
       this.networkErrors = 0;
-      if (!this.enabled || this.isMuted()) return;
+      if (!this.enabled) return;
       let final = "";
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -156,11 +171,24 @@ class BrowserListener {
         if (e.results[i].isFinal) final += text;
         else interim += text;
       }
+      // While Lumi is talking the mic mostly hears Lumi, so only the wake phrase counts: it interrupts (barge-in).
+      if (this.isMuted() && !this.barged) {
+        const heard = `${final} ${interim}`.trim();
+        if (!heard || this.wakeIndex(heard) < 0) return;
+        this.barged = true;
+        this.onBargeIn();
+      }
+      // After a barge-in, drop whatever of Lumi's own voice came before the wake phrase.
+      const cut = (text) => {
+        if (!this.barged) return text;
+        const at = this.wakeIndex(text);
+        return at >= 0 ? text.slice(at) : text;
+      };
       if (interim.trim()) {
-        this.interim = interim.trim();
+        this.interim = cut(interim.trim());
         this.onSpeechStart();
       }
-      if (final.trim()) this.emit(final.trim());
+      if (final.trim()) this.emit(cut(final.trim()));
     };
     rec.onerror = (e) => {
       if (e.error === "not-allowed") {
@@ -183,8 +211,9 @@ class BrowserListener {
     rec.onend = () => {
       this.active = false;
       // iOS sometimes ends a session without marking the last result final.
-      if (this.interim && this.enabled && !this.isMuted()) this.emit(this.interim);
+      if (this.interim && this.enabled && (this.barged || !this.isMuted())) this.emit(this.interim);
       this.interim = "";
+      this.barged = false;
       this.onSpeechEnd();
     };
     this.rec = rec;
@@ -218,6 +247,7 @@ class BrowserListener {
 
   emit(text) {
     this.interim = "";
+    this.barged = false;
     this.onSpeechEnd();
     this.onText(text);
   }
@@ -234,7 +264,8 @@ class BrowserListener {
 
   tick() {
     if (this.failed || this.waitingForTap) return;
-    const wanted = this.enabled && !this.isMuted();
+    // Keep listening while Lumi talks, so "Hi Lumi" can interrupt; onresult ignores everything else meanwhile.
+    const wanted = this.enabled;
     if (!wanted && this.active) {
       this.interim = "";
       this.rec.abort();
@@ -346,32 +377,41 @@ function createNarrator(getCloudEnabled, query) {
     speech.speak(u);
   };
 
+  // Bumped whenever playback is interrupted, so a clip that was cut off doesn't come back in the
+  // device voice on top of the next one (that was the "two voices" bug).
+  let generation = 0;
+
   const drain = () => {
     if (playing || !queue.length || !audio) return;
     const next = queue.shift();
+    const mine = generation;
     playing = true;
     hold(15000);
     audio.src = next.url;
     audio.onended = () => {
+      if (mine !== generation) return;
       playing = false;
       output.busyUntil = Date.now() + 350;
       drain();
     };
-    audio.onerror = () => {
+    // Only a real failure of the cloud voice falls back to the device voice, and only for the current line.
+    const fallBack = () => {
+      if (mine !== generation) return;
       playing = false;
       speakDevice(next.text, false);
       drain();
     };
-    void audio.play().catch(() => {
-      playing = false;
-      speakDevice(next.text, false);
-      drain();
+    audio.onerror = fallBack;
+    void audio.play().catch((err) => {
+      if (err?.name === "AbortError") return; // interrupted on purpose by a newer line
+      fallBack();
     });
   };
 
   const enqueue = (speakId, text, priority) => {
     if (!text) return;
     if (priority) {
+      generation++;
       queue = [];
       playing = false;
       if (audio) {
@@ -405,7 +445,22 @@ function createNarrator(getCloudEnabled, query) {
       }
     },
     speak(speakId, text, priority) {
+      output.current = text;
       enqueue(speakId, text, priority);
+    },
+    /** Stop talking right away (the player interrupted with the wake phrase). */
+    stop() {
+      generation++;
+      queue = [];
+      playing = false;
+      if (audio) {
+        audio.onended = audio.onerror = null;
+        audio.pause();
+        audio.removeAttribute("src");
+      }
+      if (speech) speech.cancel();
+      output.busyUntil = 0;
+      output.current = "";
     },
     cloudPlaying() {
       return Boolean(playing || (audio && !audio.paused && audio.src));
@@ -417,6 +472,8 @@ function createNarrator(getCloudEnabled, query) {
 const output = {
   busyUntil: 0,
   narrator: null,
+  /** The line Lumi is saying, so its own "Hi Lumi" (e.g. "Say Hi Lumi and try again") can't interrupt it. */
+  current: "",
   busy() {
     const n = output.narrator;
     return Boolean(speech?.speaking) || Boolean(n?.cloudPlaying()) || Date.now() < this.busyUntil;
@@ -549,6 +606,19 @@ export function initGameVoice(els, session) {
   const browserListener = Recognition
     ? new BrowserListener({
         isMuted: () => output.busy(),
+        wakeIndex: (text) => {
+          const re = wakePattern(wake);
+          // Lumi's own line saying the wake phrase must not interrupt Lumi.
+          if (output.busy() && re.test(output.current)) return -1;
+          return text.search(re);
+        },
+        onBargeIn: () => {
+          output.narrator?.stop();
+          cues.chime("wake");
+          awakeUntil = Date.now() + awakeWindow;
+          hearing = true;
+          renderState();
+        },
         onSpeechStart: () => {
           hearing = true;
           renderState();
@@ -632,6 +702,8 @@ export function initGameVoice(els, session) {
 
   /** Sends one utterance (audio or on-phone text) and reacts to what the game heard. */
   async function post(url, init) {
+    // Another phone page took over: don't send what this page's mic heard.
+    if (!isSpeaker()) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
@@ -686,8 +758,67 @@ export function initGameVoice(els, session) {
         return li;
       }),
     );
+    renderShare(snap.share);
     renderState();
   };
+
+  // ---------------------------------------------- sharing a finished quest
+
+  const shareEls = {
+    card: document.getElementById("share"),
+    title: document.getElementById("share-title"),
+    to: document.getElementById("share-to"),
+    message: document.getElementById("share-message"),
+    send: document.getElementById("share-send"),
+    cancel: document.getElementById("share-cancel"),
+  };
+  const SHARE_TITLES = {
+    offer: "Share your accomplishment with a contact?",
+    choose_contact: "Who should I send it to? Say their name.",
+    pick_option: "Which contact?",
+    confirm: "Send this message?",
+    sending: "Sending…",
+  };
+
+  /** Show the share offer and, before anything is sent, the exact message preview with Send and Cancel. */
+  function renderShare(share) {
+    if (!shareEls.card) return;
+    shareEls.card.hidden = !share;
+    if (!share) return;
+    shareEls.title.textContent = SHARE_TITLES[share.stage] ?? "Share";
+    const service = share.service === "SMS" ? "text message (SMS)" : share.service ? "iMessage" : "";
+    const options = share.stage === "pick_option" ? share.options.map((o, i) => `${i + 1}: ${o.name}`).join(" · ") : "";
+    show(shareEls.to, share.contactName ? `To ${share.contactName} (${share.handle}) by ${service}` : options);
+    show(shareEls.message, share.stage === "confirm" || share.stage === "sending" ? share.message : "");
+    shareEls.send.hidden = share.stage !== "confirm";
+    shareEls.send.textContent = share.service ? `Send by ${share.service}` : "Send";
+    shareEls.cancel.hidden = share.stage === "sending";
+  }
+
+  /** The Send and Cancel buttons answer exactly like saying "send it" or "cancel". */
+  async function answerShare(text) {
+    try {
+      const res = await fetch(`/api/game/text${query}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      notice = `Couldn't reach the laptop: ${err.message}`;
+      renderState();
+    }
+  }
+  shareEls.send?.addEventListener("click", () => {
+    shareEls.send.hidden = true; // one tap, one send
+    void answerShare("send it");
+  });
+  shareEls.cancel?.addEventListener("click", () => void answerShare("cancel"));
+
+  // Only the newest open phone page for this session speaks and listens (the server says which).
+  let myClientId = "";
+  let speakerId = "";
+  const isSpeaker = () => !speakerId || !myClientId || speakerId === myClientId;
 
   const events = new EventSource(`/api/game/events${query}`);
   events.onopen = () => {
@@ -701,12 +832,22 @@ export function initGameVoice(els, session) {
   events.onmessage = (msg) => {
     const e = JSON.parse(msg.data);
     if (e.type === "snapshot") renderQuest(e.snapshot);
+    else if (e.type === "hello") myClientId = e.clientId;
+    else if (e.type === "speaker") {
+      speakerId = e.clientId;
+      if (!isSpeaker()) {
+        output.narrator?.stop();
+        cues.update(null);
+        notice = "Lumi is talking on another page. Close this tab, or reload it to use it here.";
+      } else if (notice.startsWith("Lumi is talking on another page")) notice = "";
+      renderState();
+    }
     else if (e.type === "say") {
       thinking = false;
       // Mirrors the server: a reply keeps the conversation open.
       if (Date.now() < awakeUntil) awakeUntil = Math.max(awakeUntil, Date.now() + awakeWindow);
       show(els.line, e.text);
-      if (els.speakToggle.checked) output.narrator.speak(e.id, e.text, e.priority);
+      if (els.speakToggle.checked && isSpeaker()) output.narrator.speak(e.id, e.text, e.priority);
     } else if (e.type === "transcript" && e.text) {
       show(els.said, `You said: “${e.text}”`);
     } else if (e.type === "vision_check") {
@@ -714,6 +855,7 @@ export function initGameVoice(els, session) {
       show(els.verdict, `${e.check.verdict}${evidence}`);
       els.verdict.dataset.verdict = e.check.verdict;
     } else if (e.type === "guide") {
+      if (!isSpeaker()) return;
       cues.update(e.guidance);
       const g = e.guidance;
       const text = g.say;
