@@ -42,9 +42,21 @@ export function computeGuidance(
     const seen = lastSeen[navName];
     if (seen && now - seen.at < MEMORY_MS && Math.abs(seen.dx) > 0.05) {
       const side = seen.dx < 0 ? "left" : "right";
-      return { phase: "scan", pan: seen.dx < 0 ? -0.6 : 0.6, proximity: 0, say: `${hazard}The ${navName} was to your ${side}. Turn ${side} slowly.`, navBox: null };
+      return {
+        phase: "scan",
+        pan: seen.dx < 0 ? -0.6 : 0.6,
+        proximity: 0,
+        say: `${hazard}The ${navName} was to your ${side}. Turn your body slowly to the ${side}.`,
+        navBox: null,
+      };
     }
-    return { phase: "scan", pan: 0, proximity: 0, say: `${hazard}Sweep slowly left and right to find the ${navName}.`, navBox: null };
+    return {
+      phase: "scan",
+      pan: 0,
+      proximity: 0,
+      say: `${hazard}Hold the phone at chest height and turn slowly left, then right, so I can find the ${navName}.`,
+      navBox: null,
+    };
   }
 
   const dx = (navBox.x0 + navBox.x1) / 2 - 0.5;
@@ -53,12 +65,18 @@ export function computeGuidance(
   const proximity = clamp(0.7 * DISTANCE_PROXIMITY[obs.distance] + 0.3 * Math.sqrt(area) * 1.4, 0, 1);
 
   if (obs.distance === "within_reach" || obs.distance === "touching") {
-    return { phase: "reach", pan, proximity, say: hazard + (obs.instruction || "Reach forward slowly."), navBox };
+    return { phase: "reach", pan, proximity, say: hazard + (obs.instruction || "It's within reach. Slide your hand forward slowly, fingers relaxed."), navBox };
   }
   if (Math.abs(dx) > 0.15) {
     const side = dx < 0 ? "left" : "right";
     const amount = Math.abs(dx) > 0.3 ? "" : " a little";
     return { phase: "aim", pan, proximity, say: `${hazard}Turn${amount} ${side}.`, navBox };
   }
-  return { phase: "approach", pan, proximity, say: hazard + (obs.instruction || `The ${navName} is ahead. Step forward slowly.`), navBox };
+  return {
+    phase: "approach",
+    pan,
+    proximity,
+    say: hazard + (obs.instruction || `The ${navName} is straight ahead. Take small steps forward, one hand out at waist height.`),
+    navBox,
+  };
 }

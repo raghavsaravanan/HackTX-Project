@@ -10,6 +10,7 @@ import type {
   Quest,
   QuestMap,
   QuestStep,
+  SavedQuestSummary,
   Scene,
   ServerEvent,
   SessionSnapshot,
@@ -81,6 +82,10 @@ interface Session {
   followUps: number;
   /** Where quest objects were last seen in the frame, for steering when they leave the view. */
   lastSeen: Record<string, SeenAt>;
+  /** Quests paused for newer requests, most recent first, with their progress and map. */
+  saved: SavedQuest[];
+  /** Bumped on every new plan request, so a slower, older plan can't replace a newer one. */
+  planToken: number;
   link: { seq: number; frameId: number; inFlight: boolean };
   /** Hands-free listening: follow-ups need no wake phrase until this time. */
   awakeUntil: number;
@@ -88,6 +93,21 @@ interface Session {
   armed: boolean;
   subscribers: Set<{ res: Response; role: Role }>;
 }
+
+/** Everything needed to pick a paused quest back up where it left off. */
+interface SavedQuest {
+  quest: Quest;
+  stepIndex: number;
+  missions: MissionState[];
+  map: QuestMap;
+  goal: string;
+  followUps: number;
+  questStartedAt: number | null;
+  hintsThisQuest: number;
+  savedAt: number;
+}
+
+const MAX_SAVED = 3;
 
 const sessions = new Map<string, Session>();
 
@@ -123,6 +143,8 @@ export function getSession(id: string): Session {
       goal: "",
       followUps: 0,
       lastSeen: {},
+      saved: [],
+      planToken: 0,
       link: { seq: 0, frameId: -1, inFlight: false },
       awakeUntil: 0,
       armed: false,
@@ -149,6 +171,20 @@ export function snapshot(s: Session): SessionSnapshot {
     lastTranscript: s.lastTranscript,
     missions: s.missions,
     map: s.map,
+    savedQuests: s.saved.map(summarizeSaved),
+  };
+}
+
+function summarizeSaved(q: SavedQuest): SavedQuestSummary {
+  const next = q.quest.steps[q.stepIndex];
+  return {
+    questId: q.quest.id,
+    title: q.quest.title,
+    goal: q.goal,
+    done: q.missions.filter((m) => m.status === "done" || m.status === "skipped").length,
+    total: q.quest.steps.length,
+    next: next ? next.summary || `${next.action} ${next.target}` : "final check",
+    savedAt: q.savedAt,
   };
 }
 
@@ -161,6 +197,7 @@ const agentState = (s: Session): AgentState => ({
   setting: s.map.setting,
   landmarks: s.map.landmarks,
   recent: s.recent,
+  saved: s.saved.map(summarizeSaved),
 });
 
 // ---------- Server-sent events ----------
@@ -302,6 +339,7 @@ export function planOverview(steps: QuestStep[]): string {
 }
 
 export function startQuest(s: Session, quest: Quest, source: LineSource, scene: Scene | null = null, goal = "") {
+  if (s.quest && s.quest.id !== quest.id) saveCurrentQuest(s);
   if (scene) s.scene = scene;
   s.quest = quest;
   s.status = "active";
@@ -329,11 +367,84 @@ export function startQuest(s: Session, quest: Quest, source: LineSource, scene: 
   say(s, [quest.intro, overview, `Let's start. ${quest.steps[0].instruction}`].filter(Boolean).join(" "), source, ["start"], true);
 }
 
-function setPlanning(s: Session, transcript?: string, lookingAround = true) {
+// ---------- Switching between quests ----------
+
+/** Pause the unfinished quest and keep its progress and map, so a newer request can take over. Returns its title. */
+function saveCurrentQuest(s: Session): string | null {
+  const quest = s.quest;
+  if (!quest || s.status === "complete" || s.stepIndex >= quest.steps.length) return null;
+  s.saved = [
+    {
+      quest,
+      stepIndex: s.stepIndex,
+      missions: s.missions.map((m, i) => (i === s.stepIndex && m.status === "verifying" ? { ...m, status: "active" as const } : m)),
+      map: s.map,
+      goal: s.goal,
+      followUps: s.followUps,
+      questStartedAt: s.questStartedAt,
+      hintsThisQuest: s.hintsThisQuest,
+      savedAt: Date.now(),
+    },
+    ...s.saved.filter((q) => q.quest.id !== quest.id),
+  ].slice(0, MAX_SAVED);
+  s.quest = null;
+  s.status = "idle";
+  s.stepIndex = 0;
+  s.stepStartedAt = null;
+  s.missions = [];
+  s.verifying = false;
+  s.map = buildMap(null, s.scene);
+  return quest.title;
+}
+
+/** Find the paused quest the player means by name or goal words; the most recent when unclear. */
+function pickSaved(s: Session, which: string): SavedQuest | undefined {
+  const words = which.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+  const score = (q: SavedQuest) => words.filter((w) => `${q.quest.title} ${q.goal}`.toLowerCase().includes(w)).length;
+  const best = [...s.saved].sort((a, b) => score(b) - score(a))[0];
+  return best && score(best) > 0 ? best : s.saved[0];
+}
+
+/** Pick a paused quest back up (pausing the current one first, so nothing is lost). Returns false if none is saved. */
+export function resumeSaved(s: Session, which = "", opener = "Back to"): boolean {
+  const target = pickSaved(s, which);
+  if (!target) return false;
+  s.planToken++; // a plan still in progress for an older request must not replace this
+  s.saved = s.saved.filter((q) => q !== target);
+  saveCurrentQuest(s);
+  s.quest = target.quest;
+  s.stepIndex = target.stepIndex;
+  s.missions = target.missions;
+  s.map = target.map;
+  s.goal = target.goal;
+  s.followUps = target.followUps;
+  s.questStartedAt = target.questStartedAt;
+  s.hintsThisQuest = target.hintsThisQuest;
+  s.status = "active";
+  s.questEndedAt = null;
+  s.lastSeen = {};
+  resetStepState(s);
+  if (s.missions[s.stepIndex]) setMission(s, s.stepIndex, { status: "active" });
+  pushSnapshot(s);
+  const step = currentStep(s);
+  const done = summarizeSaved(target).done;
+  say(
+    s,
+    `${opener} "${target.quest.title}". ${done ? `You've done ${done} of ${target.quest.steps.length}. ` : ""}${step ? step.instruction : "Let's do the final check."}`,
+    "system",
+    ["start"],
+    true,
+  );
+  if (!step) void confirmGoal(s, target.quest);
+  return true;
+}
+
+function setPlanning(s: Session, transcript?: string, lookingAround = true, paused: string | null = null) {
   s.status = "planning";
   if (transcript) s.lastTranscript = transcript;
   pushSnapshot(s);
-  say(s, lookingAround ? "Give me a moment to look around. Hold the phone steady." : "Give me a moment to work out a plan.", "system", undefined, true);
+  const pausedNote = paused ? `Okay, I've paused "${paused}" and saved your progress. ` : "";
+  say(s, pausedNote + (lookingAround ? "Give me a moment to look around. Hold the phone steady." : "Give me a moment to work out a plan."), "system", undefined, true);
 }
 
 const isNetworkError = (message: string) => /fetch failed|timed out|ECONN|ENOTFOUND|socket|network/i.test(message);
@@ -514,6 +625,12 @@ function finishQuest(s: Session, quest: Quest, inspected = false) {
     say(s, line.text, line.source, undefined, true);
     broadcast(s, { type: "quest_complete", questId: quest.id, title: quest.title, recap: line.text, durationMs, stats: s.stats });
     if (!inspected) void finalInspection(s, quest);
+    // Then pick the most recent paused quest back up, unless the player has moved on meanwhile.
+    if (s.saved.length) {
+      setTimeout(() => {
+        if (s.quest?.id === quest.id && s.status === "complete") resumeSaved(s, "", "Now, back to");
+      }, 4000);
+    }
   });
 }
 
@@ -825,8 +942,12 @@ export async function pollCameraLink() {
 
 /** Survey the surroundings, then have the Quest Agent plan a quest for `goal`. Returns null when there is no camera frame. */
 export async function planFromGoal(s: Session, goal: string): Promise<SessionSnapshot> {
+  // The latest request always wins: pause and save the current quest, and outdate any older plan in progress.
+  const token = ++s.planToken;
+  const paused = saveCurrentQuest(s);
   const image = await cameraFrame();
-  setPlanning(s, goal, Boolean(image));
+  if (token !== s.planToken) return snapshot(s);
+  setPlanning(s, goal, Boolean(image), paused);
   try {
     // The camera makes plans concrete, but any goal can be planned without it.
     let scene: Scene | null = null;
@@ -843,12 +964,19 @@ export async function planFromGoal(s: Session, goal: string): Promise<SessionSna
     trackPipeline(s, "plan", "start");
     const { value: quest, ms } = await timed(() => planWithRetry(s, goal, scene));
     trackPipeline(s, "plan", "done", ms, `${quest.steps.length} steps`);
+    if (token !== s.planToken) {
+      console.log(`[plan] dropped "${goal.slice(0, 60)}": a newer request took over`);
+      return snapshot(s);
+    }
 
     const mode = questMode();
     startQuest(s, quest, mode === "mock" ? "system" : mode, scene, goal);
     return snapshot(s);
   } catch (err) {
+    if (token !== s.planToken) return snapshot(s);
     planningFailed(s, (err as Error).message);
+    // Don't leave the player with nothing: go back to what they paused for this request.
+    if (paused) resumeSaved(s, paused, "Let's get back to");
     throw err;
   }
 }
@@ -909,9 +1037,10 @@ function intentFrom(s: Session, u: Understanding, text: string, trusted: boolean
     case "command":
       return u.command !== "none" ? { type: u.command } : { type: "ask", text };
     case "new_goal":
-      // Mid-quest without the wake phrase, a "new goal" is more likely a change of plan: the agent decides.
-      if (s.quest && s.status === "active" && !trusted) return { type: "ask", text };
+      // The latest request always wins; the current quest is paused and saved, not lost.
       return { type: "start_quest", goal: u.goal || text };
+    case "return_to_saved":
+      return s.saved.length ? { type: "return_to_saved", which: u.goal } : { type: "ask", text };
     default:
       return { type: "ask", text };
   }
@@ -936,6 +1065,9 @@ export async function dispatchIntent(s: Session, intent: VoiceIntent): Promise<v
         return;
       case "ask":
         await askQuestion(s, intent.text);
+        return;
+      case "return_to_saved":
+        if (!resumeSaved(s, intent.which)) say(s, "There's nothing paused right now. What would you like to do?", "system", undefined, true);
         return;
       case "unknown":
         say(s, `I did not catch that. Say ${wakePhrase()} and try again.`, "system", undefined, true);
@@ -1026,6 +1158,8 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
         resetStepState(s);
         pushSnapshot(s);
         say(s, `Next step. ${currentStep(s)?.instruction ?? ""}`, "system", undefined, true);
+      } else if (s.status !== "active" && s.status !== "planning" && !resumeSaved(s)) {
+        say(s, "There's nothing paused. Tell me what you'd like to do.", "system", undefined, true);
       }
       return;
     case "stop":
@@ -1036,7 +1170,13 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
       s.missions = [];
       s.map = buildMap(null, s.scene);
       pushSnapshot(s);
-      say(s, "Quest stopped. I'm here if you need me.", "system", undefined, true);
+      say(
+        s,
+        s.saved.length ? `Quest stopped. "${s.saved[0].quest.title}" is still paused; say "go back" to pick it up.` : "Quest stopped. I'm here if you need me.",
+        "system",
+        undefined,
+        true,
+      );
       return;
     case "reset":
       s.status = "idle";
@@ -1045,6 +1185,8 @@ export async function runCommand(s: Session, type: CommandType): Promise<void> {
       s.stepStartedAt = null;
       s.stats = freshStats();
       s.lastTranscript = "";
+      s.saved = [];
+      s.planToken++;
       s.missions = [];
       s.map = buildMap(null, s.scene);
       pushSnapshot(s);

@@ -507,6 +507,22 @@ button.small {
   margin: 0 0 12px;
   color: var(--gold);
 }
+.paused-quests {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+}
+.paused-quests ul {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.paused-title {
+  font-weight: 600;
+}
 .steps {
   list-style: none;
   padding: 0;

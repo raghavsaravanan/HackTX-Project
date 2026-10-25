@@ -299,13 +299,40 @@ function BoxLabel({ box, text, className }: { box: Box; text: string; className:
   );
 }
 
+/** Quests set aside for newer requests; Lumi returns to them afterwards. */
+function PausedQuests({ snapshot }: { snapshot: SessionSnapshot | null }) {
+  const saved = snapshot?.savedQuests ?? [];
+  if (!saved.length) return null;
+  return (
+    <div className="paused-quests">
+      <div className="panel-title">Paused</div>
+      <ul>
+        {saved.map((q) => (
+          <li key={q.questId}>
+            <span className="paused-title">{q.title}</span>
+            <span className="muted">
+              {" "}
+              {q.done}/{q.total} done · next: {q.next}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: number }) {
   const quest = snapshot?.quest;
   if (!quest) {
     return (
       <section className="card">
         <div className="panel-title">Quest</div>
-        <p className="muted">On the phone, say “{snapshot?.wakePhrase ?? "Hi Lumi"}, help me clean my desk” to begin.</p>
+        <p className="muted">
+          {snapshot?.status === "planning"
+            ? "Planning the new quest…"
+            : `On the phone, say “${snapshot?.wakePhrase ?? "Hi Lumi"}, help me clean my desk” to begin.`}
+        </p>
+        <PausedQuests snapshot={snapshot} />
       </section>
     );
   }
@@ -337,6 +364,7 @@ function QuestPanel({ snapshot, now }: { snapshot: SessionSnapshot | null; now: 
           );
         })}
       </ol>
+      <PausedQuests snapshot={snapshot} />
     </section>
   );
 }

@@ -1,14 +1,31 @@
-import type { MapLandmark, MissionState, Quest, QuestStep, Scene, StepObservation, VisionCheck } from "../shared/types.ts";
+import type { MapLandmark, MissionState, Quest, QuestStep, SavedQuestSummary, Scene, StepObservation, VisionCheck } from "../shared/types.ts";
 import { config } from "./config.ts";
+
+/**
+ * How to guide someone who is blind. Part of every Quest Agent prompt, so no plan, reply, hint, or
+ * narration line ever assumes the player can see.
+ */
+export const BLIND_GUIDE = [
+  "The player is blind. They cannot see anything, so every instruction must work by touch, hearing, smell, memory, and your voice alone.",
+  "Never tell them to look, see, watch, spot, check visually, read a screen or label, or notice a color. Never say \"over there\" or \"this one\".",
+  "Give directions from their body: left, right, ahead, behind, clock positions (\"at your two o'clock\"), arm's lengths, steps, and heights " +
+    "(waist height, the table edge, knee level).",
+  "Explain how to do the task, not just what to do: which hand to use, how to search by touch (rest one hand on a landmark like the table edge, " +
+    "then sweep the other hand slowly in small overlapping strips, front to back), how to recognize the object by shape, size, weight, and texture, " +
+    "and how to tell by touch or sound that the step is done.",
+  "Keep them safe: move slowly with hands low and fingers relaxed, feel before grabbing, warn about anything hot, sharp, fragile, or wet, " +
+    "and remind them to bend at the knees and protect their head near tables and shelves.",
+  "Break a complex action into short spoken sub-steps in order (first, then, then). If a step needs reading or a screen, guide them to use VoiceOver or Siri, or to ask a sighted person.",
+].join(" ");
 
 export const NARRATOR = {
   name: config.agent.name,
   persona:
-    `You are ${config.agent.name}, a calm, friendly companion sitting next to the player. ` +
-    "You help with everyday tasks through short spoken lines: one or two sentences, conversational English with contractions. " +
+    `You are ${config.agent.name}, a calm, patient companion sitting next to a blind player. ` +
+    "You help with everyday tasks by voice, in conversational English with contractions, clear enough to follow without seeing anything. " +
     "Never use exclamation marks, fantasy words, or hype. Let the player lead; you respond and gently suggest the next move. " +
-    "The player cannot see: never rely on color or visual-only details; describe direction, distance, shape, and touch. " +
-    "No emojis, no markdown, no lists.",
+    BLIND_GUIDE +
+    " No emojis, no markdown, no bullet lists.",
 };
 
 /** System prompt for every Quest Agent call (planning, narration, hints, answering questions). */
@@ -52,8 +69,9 @@ export function stepVisionPrompt(step: QuestStep): string {
     "Be strict: if unsure, step_done is false and confidence is low.",
     "distance describes how far the target (or the destination, if the player is already holding the target) is from the camera: " +
       "far = more than two steps away, near = one or two steps, within_reach = arm's length, touching = hand on it.",
-    "instruction: at most 10 words, second person, a single concrete direction for the player's next move " +
-      '(e.g. "Turn slightly left.", "Reach forward and a bit lower.", "Lift it up."). Never mention the camera, image, or frame.',
+    "instruction: at most 12 words, second person, a single physical direction for a blind player's next move, using body terms " +
+      '(e.g. "Turn slightly left.", "Reach forward, a bit below waist height.", "Close your hand and lift."). ' +
+      "Never mention the camera, image, frame, or anything they would have to see, like colors.",
     'hazard: a few words if something unsafe is near the path (sharp, hot, fragile, trip hazard), otherwise "".',
   ].join("\n");
 }
@@ -239,7 +257,10 @@ export function planPrompt(goal: string, scene: Scene | null, context = ""): str
     "- target: the main object or place, short common name (matching the object list when visible). destination: empty unless action is drop or place.",
     "- summary: 2 to 6 natural spoken words with articles, e.g. \"find a trash bin\", \"throw the can away\", \"put on your shoes\".",
     "- reason: a few words on why this step serves the goal.",
-    "- instruction: one spoken line in your narrator voice, at most 20 words, telling the player what to do and where (left, right, ahead) when known.",
+    "- instruction: spoken in your narrator voice, 2 to 4 short sentences, at most 55 words, for a player who cannot see: where it is from their body " +
+      "(left, right, clock position, arm's lengths) when known, how to find it and do it by touch (hand technique, what it feels like), " +
+      "and how they'll know by touch or sound that the step is done. Include a safety note when relevant.",
+    "- Each mission must be doable without sight. Searching steps say how to search by touch or sound (sweep in strips, retrace, make the phone ring).",
     "- Order steps so each one starts from where the previous one ended, and so the last step leaves the goal fully done.",
     "- success: what done looks like. check: the same as a yes/no question where \"yes\" means done (for voice steps, a question to ask the player).",
     '- goal_check: one yes/no question confirming the whole goal from a single photo, or "" if a photo cannot show it.',
@@ -255,7 +276,7 @@ export const INTERPRET_SCHEMA = {
   type: "object",
   properties: {
     addressed_to_agent: { type: "boolean" },
-    kind: { type: "string", enum: ["new_goal", "question", "progress", "correction", "command", "chatter"] },
+    kind: { type: "string", enum: ["new_goal", "return_to_saved", "question", "progress", "correction", "command", "chatter"] },
     goal: { type: "string" },
     command: { type: "string", enum: ["none", "repeat", "skip", "pause", "resume", "stop", "describe"] },
   },
@@ -274,17 +295,21 @@ export function interpretPrompt(state: AgentState, utterance: string, wakeHeard:
         ? "You just spoke with the player, so a follow-up is likely addressed to you."
         : `It did not clearly start with your name. Speech recognition often mangles "Hi ${NARRATOR.name}" (e.g. "Enemy", "Hi Lou me", "Me"), so judge by content.`,
     quest ? `Active quest: "${quest.title}". Current mission: ${step ? step.summary || `${step.action} ${step.target}` : "none"}.` : "No quest is active.",
+    describeSaved(state.saved),
     "",
     "addressed_to_agent: true if this is the player talking to you (a request, question, answer, or update). " +
       "False for background speech, TV, fragments with no clear meaning (\"200\", \"in a\"), or talk to someone else.",
     "kind:",
-    "- new_goal: they want help doing something new (\"help me clean my table\", \"I need to find my keys\", \"get me ready for class\").",
+    "- new_goal: they want help doing something new (\"help me clean my table\", \"I need to find my keys\", \"get me ready for class\"). " +
+      "Their latest request always wins: if it differs from the active quest, it is a new_goal even mid-quest (the active quest is paused and saved).",
+    "- return_to_saved: they want to go back to a paused quest (\"let's finish the table\", \"go back to what we were doing\").",
     "- question: they ask about the room, an object, the quest, or anything else.",
     "- progress: they report on the current mission (\"I did it\", \"done\", \"I can't find it\", \"got it\").",
     "- correction: they correct you or change the plan (\"that's not trash\", \"I don't have a cloth\", \"actually let's do the desk instead\").",
     "- command: one of the commands below.",
     "- chatter: not meant for you.",
-    "goal: for new_goal, the request in the player's words, cleaned of the wake phrase and recognition errors. Otherwise \"\".",
+    "goal: for new_goal, the request in the player's words, cleaned of the wake phrase and recognition errors. " +
+      "For return_to_saved, the title of the paused quest they mean (\"\" for the most recent). Otherwise \"\".",
     "command: repeat (say that again), skip (skip this step), pause, resume, stop (end the quest), describe (what's around me); otherwise none.",
   ].join("\n");
 }
@@ -323,13 +348,21 @@ export interface AgentState {
   setting: string;
   landmarks: MapLandmark[];
   recent: StepObservation[];
+  /** Quests paused for newer requests, most recent first. */
+  saved: SavedQuestSummary[];
 }
 
-function describeState({ quest, stepIndex, missions, setting, landmarks, recent }: AgentState): string {
+const describeSaved = (saved: SavedQuestSummary[]) =>
+  saved.length
+    ? `Paused quests (set aside for newer requests, most recent first): ${saved.map((q) => `"${q.title}" (${q.done} of ${q.total} done, next: ${q.next})`).join("; ")}.`
+    : "";
+
+function describeState({ quest, stepIndex, missions, setting, landmarks, recent, saved }: AgentState): string {
   const surroundings = [
     `Surroundings (from the Vision Agent's latest survey): ${setting || "not surveyed yet"}`,
     `Map landmarks: ${landmarks.map((l) => `${l.label}${l.note ? ` (${l.note})` : ""}`).join(", ") || "none"}`,
-  ];
+    describeSaved(saved),
+  ].filter(Boolean);
   if (!quest) return ["No quest is active.", ...surroundings].join("\n");
   const lines = quest.steps.map((step, i) => {
     const m = missions[i];
@@ -359,7 +392,8 @@ const TURN_RULES = [
   "- replan: if the player corrects you (\"that's not trash\", \"I don't have a cloth\", \"the bin is full\", \"actually, do X instead\") or conditions changed so " +
     "the remaining missions no longer fit, describe in one sentence what changed and what the player now wants. The remaining missions will be re-planned from it. Otherwise \"\".",
   "Fields:",
-  "- reply: what you say aloud next, at most 35 words, in your narrator voice, ending with one concrete next action when a quest is active.",
+  "- reply: what you say aloud next, at most 60 words, in your narrator voice for a player who cannot see. When a quest is active, end with the next action " +
+    "and how to do it by touch (where from their body, hand technique, how they'll know it's done). Never refer to anything only visible.",
   "- mission_note: a few words to record on the current mission (empty string for none).",
   '- player_near: the map landmark the player is now at or holding, using its exact label, or "".',
   "- map_notes: notes to pin on landmarks the player told you about or the Vision Agent reported, e.g. {label: \"trash can\", note: \"by the door\"}. Use [] for none.",
@@ -381,7 +415,7 @@ export function agentAskPrompt(state: AgentState, utterance: string): string {
       'Otherwise set vision_question to "" and answer directly from the state above.',
     "complete_current_mission: for a mission verified by voice, true when the player says they did it. " +
       "For a mission verified by vision, always false in this pass: only a PASS from the Vision Agent can complete it.",
-    "If no quest is active and the player asks for help with something, answer helpfully in one or two sentences.",
+    "If no quest is active and the player asks for help with something, answer helpfully and practically for someone who cannot see.",
     TURN_RULES,
   ].join("\n");
 }
@@ -397,8 +431,9 @@ export function agentVerdictPrompt(state: AgentState, trigger: string, check: Vi
     "",
     "Adapt your guidance to the verdict:",
     "- PASS on the current mission's check: celebrate briefly; set complete_current_mission to true.",
-    "- FAIL: say what is still wrong using the evidence, then give one physical correction. complete_current_mission false.",
-    "- UNCERTAIN: tell the player how to help you see (hold the phone steady at chest height, turn toward the object, step back). complete_current_mission false.",
+    "- FAIL: say what is still wrong in terms they can feel or locate (where it is from their body), then how to fix it by touch. complete_current_mission false.",
+    "- UNCERTAIN: tell the player how to help you see, in physical terms (hold the phone flat against your chest, screen facing you, " +
+      "then turn your whole body slowly toward your right; or take one small step back). complete_current_mission false.",
     "- PASS on a question that is not the current mission's check: answer it; complete_current_mission false.",
     'Set vision_question to "".',
     TURN_RULES,
@@ -406,7 +441,11 @@ export function agentVerdictPrompt(state: AgentState, trigger: string, check: Vi
 }
 
 export function narrationPrompt(event: string, details: string): string {
-  return `${event}\n${details}\nRespond with one spoken line, at most 30 words.`;
+  return (
+    `${event}\n${details}\n` +
+    "Respond with what you'd say aloud, at most 60 words. If you give an instruction, keep its touch-based detail " +
+    "(where from their body, hand technique, how they'll know it's done); the player cannot see."
+  );
 }
 
 export function hintPrompt(step: QuestStep, recent: StepObservation[]): string {
@@ -421,7 +460,9 @@ export function hintPrompt(step: QuestStep, recent: StepObservation[]): string {
     `The player is stuck on this step: ${step.action} the ${step.target}${step.destination ? ` into the ${step.destination}` : ""}.`,
     "Recent camera observations, oldest first:",
     history || "(none)",
-    "Give one encouraging, specific hint, at most 22 words, with a concrete physical direction. Do not repeat the vision instruction word for word.",
+    "Give one encouraging, specific hint for a player who cannot see, at most 40 words: where to move from their body, " +
+      "and how to search or grip by touch (for example, rest your left hand on the table edge and sweep your right hand in slow strips). " +
+      "Do not repeat the vision instruction word for word.",
   ].join("\n");
 }
 
@@ -432,6 +473,7 @@ export function describePrompt(scene: Scene): string {
     `Surroundings: ${scene.setting || "unknown"}`,
     objects,
     scene.hazards.length ? `Hazards: ${scene.hazards.join("; ")}` : "",
-    "Describe the scene in at most 40 spoken words, nearest and most useful things first, using left, right, ahead, and rough distances. Mention hazards first if any.",
+    "Describe the scene for someone who cannot see, in at most 60 spoken words: hazards first, then the nearest and most useful things, " +
+      "each with where it is from their body (left, right, clock position, arm's lengths, height) and what it would feel like. No colors.",
   ].join("\n");
 }

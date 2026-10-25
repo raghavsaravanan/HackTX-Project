@@ -192,6 +192,21 @@ export interface SessionSnapshot {
   /** One entry per quest step, same order. Empty without a quest. */
   missions: MissionState[];
   map: QuestMap;
+  /** Quests set aside for newer requests, most recent first. Lumi returns to them afterwards. */
+  savedQuests: SavedQuestSummary[];
+}
+
+/** A quest paused because the player asked for something else; it keeps its progress and map. */
+export interface SavedQuestSummary {
+  questId: string;
+  title: string;
+  goal: string;
+  /** Missions already done. */
+  done: number;
+  total: number;
+  /** The mission to pick up from. */
+  next: string;
+  savedAt: number;
 }
 
 export interface VisionTiming {
@@ -216,6 +231,8 @@ export type VoiceIntent =
   | { type: "start_quest"; goal: string }
   /** A question or "I'm done" for the Quest Agent, e.g. "Is the room clean?" */
   | { type: "ask"; text: string }
+  /** Go back to a paused quest; `which` is the player's words for it ("" for the most recent). */
+  | { type: "return_to_saved"; which: string }
   | { type: CommandType }
   | { type: "unknown" };
 

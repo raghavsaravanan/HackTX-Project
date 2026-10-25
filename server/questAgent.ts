@@ -169,7 +169,7 @@ export function reactToVerdict(state: AgentState, trigger: string, check: Vision
 
 export interface Understanding {
   addressed: boolean;
-  kind: "new_goal" | "question" | "progress" | "correction" | "command" | "chatter";
+  kind: "new_goal" | "return_to_saved" | "question" | "progress" | "correction" | "command" | "chatter";
   goal: string;
   command: CommandType | "none";
 }
