@@ -175,6 +175,8 @@ export interface SessionSnapshot {
   narratorName: string;
   /** Say this, e.g. "Hi Echo", to wake hands-free listening. */
   wakePhrase: string;
+  /** ElevenLabs TTS is available for narration on the phone and hub. */
+  cloudVoice: boolean;
   lastTranscript: string;
   /** One entry per quest step, same order. Empty without a quest. */
   missions: MissionState[];
@@ -189,42 +191,15 @@ export interface VisionTiming {
 
 // ---------- HTTP payloads ----------
 
-export interface FrameRequest {
-  sessionId: string;
-  /** Monotonic per-client counter; stale responses are ignored for progression. */
-  seq: number;
-  /** JPEG as a data URL or bare base64. ~512px long edge recommended. */
-  image: string;
-}
-
-export interface FrameResponse {
-  seq: number;
-  observation: StepObservation | null;
-  guidance: Guidance;
-  timing: VisionTiming | null;
-  /** Present when this frame completed a step. */
-  stepCompleted: { stepId: string; reward: Reward } | null;
-  questCompleted: boolean;
-  snapshot: SessionSnapshot;
-}
-
 export interface StartQuestRequest {
   sessionId: string;
   /** Free-form goal, e.g. "help me clean my desk". */
   goal?: string;
   /** Skip planning and use a scripted quest (demo safety net). */
   presetId?: string;
-  /** Wide-angle frame for planning. Required with `goal`. */
-  image?: string;
 }
 
 export type CommandType = "repeat" | "skip" | "pause" | "resume" | "stop" | "describe" | "reset";
-
-export interface CommandRequest {
-  sessionId: string;
-  type: CommandType;
-  image?: string;
-}
 
 export type VoiceIntent =
   | { type: "start_quest"; goal: string }
@@ -257,8 +232,6 @@ export type LineSource = "gemini" | "muse" | "system";
 export interface AskRequest {
   sessionId: string;
   text: string;
-  /** Optional frame; otherwise the latest camera-link or console frame is used. */
-  image?: string;
 }
 
 export interface AskResponse {
@@ -269,16 +242,9 @@ export interface AskResponse {
   snapshot: SessionSnapshot;
 }
 
-export interface VisionCheckRequest {
-  sessionId: string;
-  question: string;
-  image?: string;
-}
-
 export interface MissionVerifyRequest {
   sessionId: string;
   stepId: string;
-  image?: string;
 }
 
 export type PipelineStage = "vision" | "verify" | "plan" | "agent" | "narrate" | "transcribe" | "hint";
@@ -287,7 +253,7 @@ export type PipelineStage = "vision" | "verify" | "plan" | "agent" | "narrate" |
 
 export type ServerEvent =
   | { type: "snapshot"; snapshot: SessionSnapshot }
-  | { type: "say"; text: string; source: LineSource; sfx?: Sfx[]; priority?: boolean }
+  | { type: "say"; id: string; text: string; source: LineSource; sfx?: Sfx[]; priority?: boolean }
   | { type: "reward"; stepId: string; reward: Reward }
   | { type: "quest_complete"; questId: string; title: string; recap: string; durationMs: number; stats: PlayerStats }
   | { type: "pipeline"; stage: PipelineStage; status: "start" | "done" | "error"; detail?: string; ms?: number }
@@ -296,5 +262,5 @@ export type ServerEvent =
   /** Stage-only: the latest analyzed frame. */
   | { type: "frame"; image: string; observation: StepObservation | null; guidance: Guidance; timing: VisionTiming | null }
   /** Phone-only: the same guidance without the image, for spoken cues. */
-  | { type: "guide"; guidance: Guidance }
+  | { type: "guide"; guidance: Guidance; speakId?: string }
   | { type: "transcript"; text: string };

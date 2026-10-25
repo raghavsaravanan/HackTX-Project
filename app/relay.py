@@ -36,9 +36,6 @@ class FrameRelay:
                 del self._viewers[room]
         self._pending.pop(ws, None)
 
-    def viewer_count(self, room: str) -> int:
-        return len(self._viewers.get(room, ()))
-
     def publish(self, room: str, frame: bytes) -> None:
         for ws in self._viewers.get(room, ()):
             self._pending[ws] = frame

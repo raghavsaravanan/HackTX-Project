@@ -5,9 +5,9 @@ type Preset = Omit<Quest, "id">;
 /** Scripted quests for the stage demo. Stage the room with exactly these objects. */
 export const PRESETS: Record<string, Preset> = {
   desk: {
-    title: "The Cluttered Desk of Doom",
+    title: "Tidy the desk",
     type: "boss",
-    intro: "Brave one, chaos has claimed your desk. Three relics are out of place. Let us restore order.",
+    intro: "Your desk looks cluttered. We'll put the bottle away and stow the book.",
     goalCheck: "Is the desk clear, with no water bottle or book left on it?",
     steps: [
       {
@@ -15,7 +15,7 @@ export const PRESETS: Record<string, Preset> = {
         action: "grab",
         target: "water bottle",
         destination: "",
-        instruction: "First, an empty bottle lurks on the desk. Find it and pick it up.",
+        instruction: "Find the water bottle on the desk and pick it up.",
         success: "A hand is holding the water bottle.",
         check: "Is a hand holding the water bottle?",
       },
@@ -24,7 +24,7 @@ export const PRESETS: Record<string, Preset> = {
         action: "drop",
         target: "water bottle",
         destination: "trash can",
-        instruction: "Now carry it to the trash can and drop it in.",
+        instruction: "Carry it to the trash can and drop it in.",
         success: "The water bottle is inside the trash can.",
         check: "Is the water bottle inside the trash can?",
       },
@@ -33,7 +33,7 @@ export const PRESETS: Record<string, Preset> = {
         action: "grab",
         target: "book",
         destination: "",
-        instruction: "A tome of knowledge rests on the desk. Take it.",
+        instruction: "Pick up the book on the desk.",
         success: "A hand is holding the book.",
         check: "Is a hand holding the book?",
       },
@@ -42,16 +42,16 @@ export const PRESETS: Record<string, Preset> = {
         action: "place",
         target: "book",
         destination: "backpack",
-        instruction: "Stow the book safely in your backpack.",
+        instruction: "Put the book in your backpack.",
         success: "The book is inside the backpack.",
         check: "Is the book inside the backpack?",
       },
     ],
   },
   trash: {
-    title: "Banish the Bottle",
+    title: "Trash the bottle",
     type: "side",
-    intro: "A lone bottle mocks you from the desk. Send it where it belongs.",
+    intro: "There's a bottle on the desk. We'll move it to the trash.",
     goalCheck: "Is the water bottle in the trash can and off the desk?",
     steps: [
       {
@@ -75,9 +75,9 @@ export const PRESETS: Record<string, Preset> = {
     ],
   },
   seat: {
-    title: "The Throne Awaits",
+    title: "Find a seat",
     type: "side",
-    intro: "Your weary legs deserve a throne. Let us find you a chair.",
+    intro: "Let's find a chair and sit down.",
     goalCheck: "Is the player seated on the chair?",
     steps: [
       {
@@ -85,7 +85,7 @@ export const PRESETS: Record<string, Preset> = {
         action: "find",
         target: "chair",
         destination: "",
-        instruction: "Somewhere nearby stands a chair. Sweep slowly to find it.",
+        instruction: "Pan slowly until you see a chair straight ahead.",
         success: "The chair is clearly visible and centered.",
         check: "Is a chair clearly visible straight ahead?",
       },
@@ -94,7 +94,7 @@ export const PRESETS: Record<string, Preset> = {
         action: "sit",
         target: "chair",
         destination: "",
-        instruction: "Walk to the chair, find the seat with your hand, and sit down.",
+        instruction: "Walk to the chair, feel for the seat, and sit down.",
         success: "The view is at seated height on the chair.",
         check: "Is the view at seated height, on or directly in front of the chair?",
       },

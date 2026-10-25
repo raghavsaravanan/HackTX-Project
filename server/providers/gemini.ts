@@ -3,8 +3,19 @@ import { parseJson, stripDataUrl, withTimeout } from "../util.ts";
 
 /** After a 429, skip Gemini briefly so a frame loop can't drown out transcription. */
 let cooldownUntil = 0;
+let quotaExhausted = false;
 const COOLDOWN_MS = 30_000;
+const QUOTA_COOLDOWN_MS = 5 * 60_000;
+
 export const geminiCoolingDown = () => Date.now() < cooldownUntil;
+
+export function geminiStatus() {
+  return {
+    coolingDown: geminiCoolingDown(),
+    quotaExhausted,
+    until: cooldownUntil > Date.now() ? cooldownUntil : null,
+  };
+}
 
 interface GeminiOptions {
   system: string;
@@ -60,9 +71,15 @@ export async function geminiGenerate({
     "Gemini",
   );
   if (!res.ok) {
-    if (res.status === 429) cooldownUntil = Date.now() + COOLDOWN_MS;
-    throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const errText = await res.text();
+    if (res.status === 429) {
+      const exhausted = /RESOURCE_EXHAUSTED|quota/i.test(errText);
+      quotaExhausted = exhausted;
+      cooldownUntil = Date.now() + (exhausted ? QUOTA_COOLDOWN_MS : COOLDOWN_MS);
+    }
+    throw new Error(`Gemini ${res.status}: ${errText.slice(0, 300)}`);
   }
+  quotaExhausted = false;
   const json = (await res.json()) as {
     candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[];
   };

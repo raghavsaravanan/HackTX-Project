@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { MapLandmark, MissionState, QuestStep, SessionSnapshot, VisionCheck } from "../../../shared/types.ts";
-import { api } from "./api.ts";
+import { api } from "../lib/api.ts";
 
 // Map coordinates are 0..100 on both axes; the SVG is wider than tall.
 const W = 160;

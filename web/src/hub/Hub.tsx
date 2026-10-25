@@ -115,7 +115,12 @@ function Apis({ health }: { health: Health | null }) {
     { job: "Plan, guide, answer", service: "Gemini Quest Agent", model: health?.quest ?? "…", where: "server/questAgent.ts" },
     { job: "See, verify", service: "Gemini Vision Agent", model: health?.vision ?? "…", where: "server/vision.ts, on 1 frame per second from the phone" },
     { job: "Fallback brain", service: "Meta Muse Spark", model: health?.muse ?? "…", where: "Used when Gemini is rate-limited or down" },
-    { job: "Speak", service: "Phone speech synthesis (no API)", model: "on-device", where: "static/js/voice.js; the Quest tab can also speak" },
+    {
+      job: "Speak",
+      service: health?.speak && !/on-device/i.test(health.speak) ? "ElevenLabs TTS" : "Browser speech (fallback)",
+      model: health?.speak ?? "on-device",
+      where: "Game API /api/tts/:id → phone /api/game/tts/:id; Quest tab uses the same proxy",
+    },
     { job: "Video", service: "WebRTC, server relay fallback (no API)", model: "LAN only", where: "Camera server signaling, Live camera tab" },
   ];
   const link = health?.cameraLink;

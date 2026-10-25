@@ -1,19 +1,12 @@
-"""Frame buffer + preprocessing that turns raw video snapshots into Llama-ready images.
+"""Frame buffer + preprocessing for the phone's camera snapshots.
 
-The laptop viewer grabs JPEG snapshots from the live WebRTC <video> element and
-pushes them over a WebSocket. Each snapshot is normalised here so it can be handed
-straight to a vision-capable Llama model:
-
-* decoded and converted to RGB (drops alpha / odd color modes, applies EXIF rotation)
-* downscaled so the longest side is <= ``max_side`` (default 1120 = 2x2 tiles of
-  560px, the largest canvas Llama 3.2 Vision uses without further downsampling)
-* re-encoded as baseline JPEG and base64'd, ready for an OpenAI-style
-  ``image_url`` content part (``data:image/jpeg;base64,...``)
+The phone sends one JPEG a second over a WebSocket. Each one is decoded, EXIF-rotated,
+converted to RGB, downscaled so the longest side is <= ``max_side``, and re-encoded as
+JPEG. The game API polls the newest frame for its Vision Agent.
 """
 
 from __future__ import annotations
 
-import base64
 import io
 import itertools
 import time
@@ -33,17 +26,6 @@ class PreparedFrame:
     source_width: int
     source_height: int
     jpeg: bytes = field(repr=False)
-
-    @property
-    def base64(self) -> str:
-        return base64.b64encode(self.jpeg).decode("ascii")
-
-    @property
-    def data_url(self) -> str:
-        return f"data:image/jpeg;base64,{self.base64}"
-
-    def to_pil(self) -> Image.Image:
-        return Image.open(io.BytesIO(self.jpeg)).convert("RGB")
 
     def metadata(self) -> dict:
         return {
@@ -95,9 +77,6 @@ class FrameBuffer:
         if n <= 0:
             return []
         return list(self._frames)[-n:]
-
-    def get(self, frame_id: int) -> PreparedFrame | None:
-        return next((f for f in self._frames if f.frame_id == frame_id), None)
 
     def __len__(self) -> int:
         return len(self._frames)

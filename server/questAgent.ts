@@ -64,7 +64,7 @@ export function narrate(event: string, details: string, fallback: string): Promi
 export function hint(step: QuestStep, recent: StepObservation[]): Promise<Line> {
   const last = recent.at(-1);
   const fallback = last?.targetVisible
-    ? `Steady, hero. ${last.instruction}`
+    ? `Take your time. ${last.instruction}`
     : `Take a slow breath and sweep the phone gently from left to right to find the ${step.destination && last?.holdingTarget ? step.destination : step.target}.`;
   return speak("hint", hintPrompt(step, recent), fallback);
 }

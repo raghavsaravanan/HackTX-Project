@@ -1,5 +1,5 @@
-// Laptop page: receive the phone's WebRTC stream, display it, and push sampled
-// frames to the backend where they're prepared for a vision Llama model.
+// Laptop page (the hub's Live camera tab): receive the phone's WebRTC stream and display it,
+// falling back to JPEG frames relayed through the server.
 import { RTC_CONFIG, Signaling, roomFromUrl, setStatus, wsUrl } from "./common.js";
 
 const video = document.getElementById("remote");
@@ -7,13 +7,6 @@ const relayCanvas = document.getElementById("relay");
 const placeholder = document.getElementById("placeholder");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
-const captureToggle = document.getElementById("capture");
-const fpsInput = document.getElementById("fps");
-const fpsLabel = document.getElementById("fps-label");
-const frameInfo = document.getElementById("frame-info");
-const lastFrame = document.getElementById("last-frame");
-const askForm = document.getElementById("ask");
-const answerEl = document.getElementById("answer");
 
 const room = roomFromUrl();
 let pc = null;
@@ -25,7 +18,6 @@ fetch(`/api/info?room=${encodeURIComponent(room)}`)
   .then((info) => {
     const a = document.getElementById("phone-url");
     a.href = a.textContent = info.phone_url;
-    document.getElementById("model").textContent = `${info.llama.model} @ ${info.llama.base_url}`;
   });
 
 // -------------------------------------------------------------- WebRTC
@@ -175,67 +167,6 @@ setInterval(async () => {
   });
 }, 1000);
 
-// ------------------------------------------------------ frame capture
-// Snapshots of the <video> element are JPEG-encoded and sent as binary
-// WebSocket messages; the server normalises them for the Llama model.
-const MAX_CAPTURE_SIDE = 1120; // matches the server's FRAME_MAX_SIDE default
-const canvas = document.createElement("canvas");
-const ctx = canvas.getContext("2d");
-let frameWs = null;
-let captureTimer = null;
-let inFlight = false;
-let sentCount = 0;
-
-function openFrameSocket() {
-  frameWs = new WebSocket(wsUrl("/ws/frames"));
-  frameWs.binaryType = "arraybuffer";
-  frameWs.onmessage = (e) => {
-    inFlight = false;
-    const msg = JSON.parse(e.data);
-    if (msg.type === "frame") {
-      sentCount++;
-      frameInfo.textContent = `#${msg.frame_id} · ${msg.width}×${msg.height} (from ${msg.source_width}×${msg.source_height}) · ${(msg.bytes / 1024).toFixed(0)} KB · ${sentCount} sent`;
-      lastFrame.src = `/api/frames/${msg.frame_id}.jpg`;
-    } else {
-      frameInfo.textContent = `Frame error: ${msg.detail}`;
-    }
-  };
-  frameWs.onclose = () => { inFlight = false; if (captureToggle.checked) setTimeout(openFrameSocket, 1000); };
-}
-
-function grabFrame() {
-  const useRelay = !relayCanvas.hidden;
-  const [w, h] = useRelay ? [relayCanvas.width, relayCanvas.height] : [video.videoWidth, video.videoHeight];
-  // Skip if no video yet, or the previous frame hasn't been acknowledged (back-pressure).
-  if (inFlight || !w || frameWs?.readyState !== WebSocket.OPEN) return;
-  // Downscale here (the server would anyway) so encoding stays cheap and never
-  // steals time from video playback.
-  const scale = Math.min(1, MAX_CAPTURE_SIDE / Math.max(w, h));
-  canvas.width = Math.round(w * scale);
-  canvas.height = Math.round(h * scale);
-  ctx.drawImage(useRelay ? relayCanvas : video, 0, 0, canvas.width, canvas.height);
-  inFlight = true;
-  canvas.toBlob(async (blob) => {
-    if (blob && frameWs.readyState === WebSocket.OPEN) frameWs.send(await blob.arrayBuffer());
-    else inFlight = false;
-  }, "image/jpeg", 0.92);
-}
-
-function restartCapture() {
-  clearInterval(captureTimer);
-  captureTimer = null;
-  if (!captureToggle.checked) { frameWs?.close(); frameWs = null; return; }
-  if (!frameWs || frameWs.readyState > WebSocket.OPEN) openFrameSocket();
-  captureTimer = setInterval(grabFrame, 1000 / Number(fpsInput.value));
-}
-
-captureToggle.addEventListener("change", restartCapture);
-fpsInput.addEventListener("input", () => {
-  fpsLabel.textContent = fpsInput.value;
-  if (captureToggle.checked) restartCapture();
-});
-fpsLabel.textContent = fpsInput.value;
-
 // ---------------------------------------------------------- fullscreen
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
@@ -243,24 +174,3 @@ function toggleFullscreen() {
 }
 video.addEventListener("dblclick", toggleFullscreen);
 document.getElementById("fullscreen").addEventListener("click", toggleFullscreen);
-
-// ---------------------------------------------------------- Ask Llama
-askForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const button = askForm.querySelector("button");
-  button.disabled = true;
-  answerEl.textContent = "Thinking…";
-  try {
-    const res = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: askForm.prompt.value, num_frames: Number(askForm.frames.value) }),
-    });
-    const body = await res.json();
-    answerEl.textContent = res.ok ? body.answer : `Error: ${body.detail}`;
-  } catch (err) {
-    answerEl.textContent = `Error: ${err.message}`;
-  } finally {
-    button.disabled = false;
-  }
-});

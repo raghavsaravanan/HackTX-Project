@@ -87,7 +87,7 @@ export async function museTranscribe(wav: Buffer, keywords: string[] = []): Prom
         headers: { Authorization: `Bearer ${config.muse.apiKey}`, Accept: "application/json" },
         body: form,
       }),
-      20000,
+      8000,
       "Muse Voice Transcribe",
     );
   };
@@ -97,6 +97,14 @@ export async function museTranscribe(wav: Buffer, keywords: string[] = []): Prom
   } catch (err) {
     if (!/fetch failed/i.test((err as Error).message)) throw err;
     res = await send();
+  }
+  if (res.status >= 500) {
+    try {
+      const retry = await send();
+      if (retry.ok) res = retry;
+    } catch {
+      /* use first 5xx body below */
+    }
   }
   if (!res.ok) throw new Error(`Muse Voice Transcribe ${res.status}: ${(await res.text()).slice(0, 300)}`);
   const json = (await res.json()) as { transcript?: string };

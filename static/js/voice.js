@@ -154,29 +154,138 @@ function encodeWav(samples, rate) {
 
 const speech = typeof speechSynthesis === "undefined" ? null : speechSynthesis;
 
+/** Minimal silent MP3 — unlocks `<audio>` playback inside a user gesture on iOS. */
+const SILENT_MP3 =
+  "data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAADhAC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAA4SpmwxxAAAA//sQZAAP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQZB4P8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
+
+function pickDeviceVoice() {
+  if (!speech) return null;
+  const voices = speech.getVoices();
+  const enUs = voices.filter((v) => v.lang === "en-US" || v.lang.startsWith("en-US"));
+  const pool = enUs.length ? enUs : voices.filter((v) => v.lang.startsWith("en"));
+  const premium = (v) => /Premium|Enhanced|Natural/i.test(v.name);
+  return pool.find(premium) ?? pool.find((v) => v.lang.startsWith("en")) ?? null;
+}
+
+/** Cloud TTS with on-device fallback; one reused `<audio>` element and a small queue. */
+function createNarrator(getCloudEnabled, query) {
+  const audio = typeof Audio !== "undefined" ? new Audio() : null;
+  if (audio) audio.setAttribute("playsinline", "");
+  let queue = [];
+  let playing = false;
+  let voice = null;
+  if (speech) {
+    const pick = () => {
+      voice = pickDeviceVoice();
+    };
+    pick();
+    speech.addEventListener("voiceschanged", pick);
+  }
+
+  const hold = (ms) => {
+    output.busyUntil = Math.max(output.busyUntil, Date.now() + ms);
+  };
+
+  const speakDevice = (text, priority) => {
+    if (!speech || !text) return;
+    if (priority) {
+      speech.cancel();
+      queue = [];
+      playing = false;
+      if (audio) {
+        audio.pause();
+        audio.removeAttribute("src");
+      }
+    }
+    const u = new SpeechSynthesisUtterance(text);
+    if (voice) u.voice = voice;
+    u.rate = 0.95;
+    hold(Math.min(12000, 800 + text.length * 70));
+    u.onend = u.onerror = () => {
+      output.busyUntil = Date.now() + 400;
+    };
+    speech.speak(u);
+  };
+
+  const drain = () => {
+    if (playing || !queue.length || !audio) return;
+    const next = queue.shift();
+    playing = true;
+    hold(15000);
+    audio.src = next.url;
+    audio.onended = () => {
+      playing = false;
+      output.busyUntil = Date.now() + 350;
+      drain();
+    };
+    audio.onerror = () => {
+      playing = false;
+      speakDevice(next.text, false);
+      drain();
+    };
+    void audio.play().catch(() => {
+      playing = false;
+      speakDevice(next.text, false);
+      drain();
+    });
+  };
+
+  const enqueue = (speakId, text, priority) => {
+    if (!text) return;
+    if (priority) {
+      queue = [];
+      playing = false;
+      if (audio) {
+        audio.pause();
+        audio.removeAttribute("src");
+      }
+      if (speech) speech.cancel();
+    }
+    if (getCloudEnabled() && speakId) {
+      queue.push({ url: `/api/game/tts/${encodeURIComponent(speakId)}${query}`, text });
+      drain();
+      return;
+    }
+    speakDevice(text, priority);
+  };
+
+  return {
+    unlock() {
+      if (!audio) return;
+      audio.volume = 0;
+      audio.src = SILENT_MP3;
+      void audio.play().then(() => {
+        audio.pause();
+        audio.volume = 1;
+        audio.removeAttribute("src");
+      });
+      if (speech) {
+        const u = new SpeechSynthesisUtterance(" ");
+        u.volume = 0;
+        speech.speak(u);
+      }
+    },
+    speak(speakId, text, priority) {
+      enqueue(speakId, text, priority);
+    },
+    cloudPlaying() {
+      return Boolean(playing || (audio && !audio.paused && audio.src));
+    },
+  };
+}
+
 /** Tracks when the phone is making sound, so the listener doesn't transcribe its own voice. */
 const output = {
   busyUntil: 0,
+  narrator: null,
   busy() {
-    return Boolean(speech?.speaking) || Date.now() < this.busyUntil;
+    const n = output.narrator;
+    return Boolean(speech?.speaking) || Boolean(n?.cloudPlaying()) || Date.now() < this.busyUntil;
   },
   hold(ms) {
     this.busyUntil = Math.max(this.busyUntil, Date.now() + ms);
   },
 };
-
-function speak(text, priority) {
-  if (!speech || !text) return;
-  if (priority) speech.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.rate = 1.02;
-  // speaking can flip false between queued lines; cover the gap and a short echo tail.
-  output.hold(Math.min(12000, 800 + text.length * 70));
-  u.onend = u.onerror = () => {
-    output.busyUntil = Date.now() + 400;
-  };
-  speech.speak(u);
-}
 
 // ------------------------------------------------- directional beeps, chimes
 
@@ -246,10 +355,16 @@ export function initGameVoice(els, session) {
   let awakeWindow = 20000;
   let hearing = false;
   let pending = 0;
-  let queue = Promise.resolve();
-  let lastGuide = "";
+  let sending = false;
+  let latestWav = null;
+  let latestAt = 0;
+  const MAX_WAV_AGE_MS = 8000;
+  const FETCH_TIMEOUT_MS = 20000;
+  let lastGuideKey = "";
   let lastGuideAt = 0;
+  let cloudVoice = false;
   let notice = "";
+  let thinking = false;
 
   const show = (el, text) => {
     el.textContent = text;
@@ -263,7 +378,7 @@ export function initGameVoice(els, session) {
     else if (!listener.running) text = `Tap Start, then say “${wake}, help me tidy my desk.”`;
     else if (!listener.enabled) text = "Listening is off. Turn it on below, or type.";
     else if (hearing) [text, mode] = ["Hearing you…", "hearing"];
-    else if (pending) [text, mode] = ["Understanding…", "busy"];
+    else if (pending || thinking) [text, mode] = ["Thinking…", "busy"];
     else if (Date.now() < awakeUntil) [text, mode] = ["I'm listening. Go ahead.", "awake"];
     else [text, mode] = [`Say “${wake}” to talk to me.`, "asleep"];
     els.state.textContent = text;
@@ -282,17 +397,44 @@ export function initGameVoice(els, session) {
       renderState();
     },
     onUtterance: (wav) => {
-      pending++;
-      queue = queue.then(() => send(wav)).finally(() => {
-        pending--;
-        renderState();
-      });
+      latestWav = wav;
+      latestAt = Date.now();
+      void drainUtterances();
     },
   });
 
+  async function drainUtterances() {
+    if (sending) return;
+    while (latestWav) {
+      if (Date.now() - latestAt > MAX_WAV_AGE_MS) {
+        latestWav = null;
+        break;
+      }
+      const wav = latestWav;
+      latestWav = null;
+      sending = true;
+      pending++;
+      renderState();
+      try {
+        await send(wav);
+      } finally {
+        sending = false;
+        pending--;
+        renderState();
+      }
+    }
+  }
+
   async function send(wav) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch(`/api/game/voice${query}`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav });
+      const res = await fetch(`/api/game/voice${query}`, {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: wav,
+        signal: ctrl.signal,
+      });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? body.detail ?? `HTTP ${res.status}`);
       notice = "";
@@ -301,21 +443,34 @@ export function initGameVoice(els, session) {
       if (body.heard === "woke") cues.chime("wake");
       else if (body.heard === "command") {
         cues.chime("ok");
+        thinking = true;
         show(els.said, `You said: “${body.transcript}”`);
       } else if (body.transcript) {
-        const tip = body.heard === "ignored" ? `To start a new quest, say “${wake}, …”` : `Start with “${wake}”.`;
-        show(els.said, `Heard “${body.transcript}”. ${tip}`);
+        if (body.heard === "asleep") {
+          els.state.textContent = `Heard “${body.transcript}”. Say “${wake}” first.`;
+          els.state.dataset.mode = "asleep";
+        } else {
+          const tip = body.heard === "ignored" ? `To start a new quest, say “${wake}, …”` : `Start with “${wake}”.`;
+          show(els.said, `Heard “${body.transcript}”. ${tip}`);
+        }
       }
     } catch (err) {
-      notice = `Voice failed: ${err.message}`;
+      const msg = err.name === "AbortError" ? "That took too long. Try again." : err.message;
+      notice = `Voice failed: ${msg}`;
+      cues.tone(220, 0.25, 0, 0.08);
       setTimeout(() => {
         notice = "";
       }, 5000);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
+  output.narrator = createNarrator(() => cloudVoice, query);
+
   const renderQuest = (snap) => {
     wake = snap.wakePhrase || wake;
+    cloudVoice = Boolean(snap.cloudVoice);
     const quest = snap.quest;
     const step = quest?.steps[snap.stepIndex];
     els.questTitle.textContent = quest ? quest.title : snap.status === "planning" ? "Planning your quest…" : "No quest yet";
@@ -346,10 +501,11 @@ export function initGameVoice(els, session) {
     const e = JSON.parse(msg.data);
     if (e.type === "snapshot") renderQuest(e.snapshot);
     else if (e.type === "say") {
+      thinking = false;
       // Mirrors the server: a reply keeps the conversation open.
       if (Date.now() < awakeUntil) awakeUntil = Math.max(awakeUntil, Date.now() + awakeWindow);
       show(els.line, e.text);
-      if (els.speakToggle.checked) speak(e.text, e.priority);
+      if (els.speakToggle.checked) output.narrator.speak(e.id, e.text, e.priority);
     } else if (e.type === "transcript" && e.text) {
       show(els.said, `You said: “${e.text}”`);
     } else if (e.type === "vision_check") {
@@ -358,13 +514,17 @@ export function initGameVoice(els, session) {
       els.verdict.dataset.verdict = e.check.verdict;
     } else if (e.type === "guide") {
       cues.update(e.guidance);
-      const text = e.guidance.say;
+      const g = e.guidance;
+      const text = g.say;
       const now = Date.now();
-      if (!text || !els.speakToggle.checked || speech?.speaking) return;
-      if (now - lastGuideAt < (text === lastGuide ? 6000 : 2500)) return;
-      lastGuide = text;
+      if (!text || !els.speakToggle.checked || output.busy()) return;
+      const panBucket = g.pan > 0.15 ? "r" : g.pan < -0.15 ? "l" : "c";
+      const key = `${g.phase}:${panBucket}`;
+      if (key === lastGuideKey && now - lastGuideAt < 5000) return;
+      if (now - lastGuideAt < 5000) return;
+      lastGuideKey = key;
       lastGuideAt = now;
-      speak(text, false);
+      output.narrator.speak(e.speakId, text, false);
     }
   };
 
@@ -403,11 +563,7 @@ export function initGameVoice(els, session) {
         cues.attach(ctx);
       }
       void ctx.resume();
-      if (speech) {
-        const u = new SpeechSynthesisUtterance(" ");
-        u.volume = 0;
-        speech.speak(u);
-      }
+      output.narrator?.unlock();
     },
     async listen() {
       if (!ctx || listener.running) return;

@@ -5,7 +5,6 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.frames import FrameBuffer, prepare_image
-from app.llama import build_messages
 from app.main import app
 
 
@@ -27,17 +26,12 @@ def test_prepare_image_keeps_small_frames():
     assert size == (640, 480)
 
 
-def test_frame_buffer_ring_and_messages():
+def test_frame_buffer_keeps_newest_frames():
     buf = FrameBuffer(maxlen=3)
     for _ in range(5):
         buf.add(_jpeg(100, 100))
     assert len(buf) == 3
     assert [f.frame_id for f in buf.latest(2)] == [4, 5]
-
-    msgs = build_messages("hi", buf.latest(1))
-    image_part = msgs[-1]["content"][1]
-    assert image_part["type"] == "image_url"
-    assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
 def test_signaling_relay_between_sender_and_viewer():
@@ -98,33 +92,6 @@ def test_frame_ingest_and_latest_endpoint():
     assert Image.open(io.BytesIO(base64.b64decode(small["base64"]))).size == (640, 360)
 
 
-def test_analyze_sends_openai_style_request(monkeypatch):
-    import json
-
-    import httpx
-
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "a red square"}}]})
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-
-    client = TestClient(app)
-    with client.websocket_connect("/ws/frames") as ws:
-        ws.send_bytes(_jpeg(320, 240))
-        ws.receive_json()
-    resp = client.post("/api/analyze", json={"prompt": "What is it?"})
-    assert resp.status_code == 200 and resp.json()["answer"] == "a red square"
-    assert seen["url"].endswith("/chat/completions")
-    user = seen["body"]["messages"][-1]["content"]
-    assert user[0] == {"type": "text", "text": "What is it?"}
-    assert user[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-
-
 def _mock_game_api(monkeypatch, handler):
     import httpx
 
@@ -170,6 +137,38 @@ def test_game_voice_rejects_bad_session_and_empty_audio():
     client = TestClient(app)
     assert client.post("/api/game/voice?session=../etc", content=b"x").status_code == 400
     assert client.post("/api/game/voice").status_code == 400
+
+
+def test_game_tts_streams_from_sidequest(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, content=b"\xff\xfbMP3", headers={"Content-Type": "audio/mpeg"})
+
+    _mock_game_api(monkeypatch, handler)
+    res = TestClient(app).get("/api/game/tts/ln_abc1234")
+    assert res.status_code == 200 and res.content == b"\xff\xfbMP3"
+    assert res.headers["content-type"].startswith("audio/mpeg")
+    assert seen["url"].endswith("/api/tts/ln_abc1234")
+
+
+def test_game_tts_rejects_bad_line_id():
+    assert TestClient(app).get("/api/game/tts/not-valid").status_code == 400
+
+
+def test_game_voice_maps_upstream_timeout_to_504(monkeypatch):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("slow")
+
+    _mock_game_api(monkeypatch, handler)
+    res = TestClient(app).post("/api/game/voice?session=demo", content=b"RIFFfakewav", headers={"Content-Type": "audio/wav"})
+    assert res.status_code == 504
+    assert "timed out" in res.json()["detail"].lower()
 
 
 def test_game_events_relays_server_sent_events(monkeypatch):

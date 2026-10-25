@@ -44,17 +44,57 @@ interface RawVerdict {
   summary: string;
 }
 
-/** One vision call at a time, so a frame loop can't open dozens of sockets and starve transcription. */
-let pending: Promise<unknown> = Promise.resolve();
-function queued<T>(fn: () => Promise<T>): Promise<T> {
-  const run = pending.then(fn, fn);
-  pending = run.then(() => undefined, () => undefined);
+type VisionLane = "interactive" | "background";
+
+/** Interactive work (player asked) runs first; background frame work is dropped while anything is queued or running. */
+let interactiveTail: Promise<unknown> = Promise.resolve();
+let running = 0;
+let interactiveQueued = 0;
+
+function visionBusy() {
+  return running > 0 || interactiveQueued > 0;
+}
+
+function queueInteractive<T>(fn: () => Promise<T>): Promise<T> {
+  interactiveQueued++;
+  const run = interactiveTail.then(async () => {
+    running++;
+    try {
+      return await fn();
+    } finally {
+      running--;
+      interactiveQueued--;
+    }
+  });
+  interactiveTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
   return run;
 }
 
+async function runBackground<T>(fn: () => Promise<T>): Promise<T | null> {
+  if (visionBusy()) return null;
+  running++;
+  try {
+    return await fn();
+  } finally {
+    running--;
+  }
+}
+
+function scheduleVision<T>(
+  lane: VisionLane,
+  fn: () => Promise<{ value: T; provider: "gemini" | "muse" }>,
+): Promise<{ value: T; provider: "gemini" | "muse" } | null> {
+  if (lane === "interactive") return queueInteractive(fn);
+  return runBackground(fn);
+}
+
 /** Gemini first; on failure (quota, timeout) fall back to Muse Spark vision when a Meta key is present. */
-function visionJson<T>(prompt: string, image: string, schema: object, name: string, system = VISION_SYSTEM) {
-  return queued(() => visionJsonNow<T>(prompt, image, schema, name, system));
+function visionJson<T>(prompt: string, image: string, schema: object, name: string, lane: VisionLane, system = VISION_SYSTEM) {
+  const work = () => visionJsonNow<T>(prompt, image, schema, name, system);
+  return scheduleVision(lane, work);
 }
 
 async function visionJsonNow<T>(
@@ -73,7 +113,10 @@ async function visionJsonNow<T>(
   });
   if (visionMode() !== "gemini" || geminiCoolingDown()) return viaMuse();
   try {
-    return { value: await geminiJson<T>({ system, prompt, image, schema, model: config.gemini.visionModel, apiKey: config.gemini.visionApiKey }), provider: "gemini" };
+    return {
+      value: await geminiJson<T>({ system, prompt, image, schema, model: config.gemini.visionModel, apiKey: config.gemini.visionApiKey }),
+      provider: "gemini",
+    };
   } catch (err) {
     if (!hasMuse()) throw err;
     console.warn("[vision] Gemini failed, using Muse Spark:", redact((err as Error).message).slice(0, 120));
@@ -113,10 +156,12 @@ export async function inspect(question: string, image: string | null, context = 
       ms: 0,
     };
   }
+  const wrapped = await timed(() => visionJson<RawVerdict>(verifyPrompt(question, context), image, VERIFY_SCHEMA, "vision_check", "interactive", VERIFY_SYSTEM));
+  if (!wrapped.value) throw new Error("Vision unavailable");
   const {
     value: { value: raw, provider },
     ms,
-  } = await timed(() => visionJson<RawVerdict>(verifyPrompt(question, context), image, VERIFY_SCHEMA, "vision_check", VERIFY_SYSTEM));
+  } = { value: wrapped.value, ms: wrapped.ms };
   const confidence = clamp(Number(raw.confidence) || 0, 0, 1);
   const claimed: Verdict = raw.verdict === "PASS" || raw.verdict === "FAIL" ? raw.verdict : "UNCERTAIN";
   return {
@@ -135,15 +180,17 @@ export async function observeStep(
   image: string,
   step: QuestStep,
   mockTick: number,
-): Promise<{ observation: StepObservation; timing: VisionTiming }> {
+): Promise<{ observation: StepObservation; timing: VisionTiming } | null> {
   const mode = visionMode();
   if (mode === "mock") {
     return { observation: mockObservation(step, mockTick), timing: { provider: "mock", model: "mock", ms: 0 } };
   }
+  const timedResult = await timed(() => visionJson<RawObservation>(stepVisionPrompt(step), image, OBSERVATION_SCHEMA, "step_observation", "background"));
+  if (!timedResult.value) return null;
   const {
     value: { value: raw, provider },
     ms,
-  } = await timed(() => visionJson<RawObservation>(stepVisionPrompt(step), image, OBSERVATION_SCHEMA, "step_observation"));
+  } = timedResult;
   const targetBox = boxFrom1000(raw.target_box);
   const handBox = boxFrom1000(raw.hand_box);
   const destinationBox = boxFrom1000(raw.destination_box);
@@ -166,14 +213,16 @@ export async function observeStep(
   };
 }
 
-export async function scanScene(image: string): Promise<{ scene: Scene; timing: VisionTiming }> {
+export async function scanScene(image: string, lane: VisionLane = "interactive"): Promise<{ scene: Scene; timing: VisionTiming } | null> {
   const mode = visionMode();
   if (mode === "mock") return { scene: MOCK_SCENE, timing: { provider: "mock", model: "mock", ms: 0 } };
 
+  const timedResult = await timed(() => visionJson<RawScene>(SCAN_PROMPT, image, SCENE_SCHEMA, "scene", lane));
+  if (!timedResult.value) return null;
   const {
     value: { value: raw, provider },
     ms,
-  } = await timed(() => visionJson<RawScene>(SCAN_PROMPT, image, SCENE_SCHEMA, "scene"));
+  } = timedResult;
   const objects = raw.objects
     .map((o): SceneObject | null => {
       const box = boxFrom1000(o.box_2d);
@@ -182,3 +231,5 @@ export async function scanScene(image: string): Promise<{ scene: Scene; timing: 
     .filter((o): o is SceneObject => o !== null);
   return { scene: { setting: raw.setting ?? "", objects, hazards: raw.hazards ?? [] }, timing: { provider, model: modelFor(provider), ms } };
 }
+
+export const visionQueueStatus = () => ({ busy: visionBusy(), interactiveQueued, running });

@@ -3,56 +3,30 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Phone Cam Viewer</title>
+  <title>Live camera</title>
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body class="viewer">
   <main>
     <header>
-      <h1>Phone cam → MacBook</h1>
+      <h1>Live phone camera</h1>
       <p id="status" class="status" data-state="idle">Connecting to server…</p>
     </header>
 
-    <div class="layout">
-      <section class="stage">
-        <div class="video-wrap">
-          <video id="remote" autoplay playsinline muted></video>
-          <canvas id="relay" hidden></canvas>
-          <div id="placeholder" class="placeholder">
-            <img id="qr" alt="QR code linking to the phone page" width="200" height="200">
-            <p>Scan with your phone (same Wi-Fi), or open<br><a id="phone-url" href="#"></a></p>
-          </div>
+    <section>
+      <div class="video-wrap">
+        <video id="remote" autoplay playsinline muted></video>
+        <canvas id="relay" hidden></canvas>
+        <div id="placeholder" class="placeholder">
+          <img id="qr" alt="QR code linking to the phone page" width="200" height="200">
+          <p>Scan with your phone (same Wi-Fi), or open<br><a id="phone-url" href="#"></a></p>
         </div>
-        <div class="row stats-row">
-          <p id="stats" class="stats"></p>
-          <button id="fullscreen" type="button">Fullscreen</button>
-        </div>
-      </section>
-
-      <aside>
-        <section class="card">
-          <h2>Frames for Llama</h2>
-          <label class="row"><input type="checkbox" id="capture"> Also forward frames from this viewer</label>
-          <label class="row">Rate <input type="range" id="fps" min="0.5" max="10" step="0.5" value="2"> <span id="fps-label"></span> fps</label>
-          <p id="frame-info" class="muted">No frames sent yet.</p>
-          <img id="last-frame" class="last-frame" alt="">
-          <p class="muted small">Latest prepared frame: <a href="/api/frames/latest" target="_blank">JSON (base64)</a> · <a href="/api/frames/latest.jpg" target="_blank">JPEG</a> · <a href="/docs" target="_blank">API docs</a></p>
-        </section>
-
-        <section class="card">
-          <h2>Ask the vision model</h2>
-          <p class="muted small" id="model"></p>
-          <form id="ask">
-            <textarea name="prompt" rows="3">What do you see in this image?</textarea>
-            <div class="row">
-              <label>Frames <input type="number" name="frames" min="1" max="8" value="1"></label>
-              <button class="primary" type="submit">Ask</button>
-            </div>
-          </form>
-          <pre id="answer" class="answer"></pre>
-        </section>
-      </aside>
-    </div>
+      </div>
+      <div class="row stats-row">
+        <p id="stats" class="stats"></p>
+        <button id="fullscreen" type="button">Fullscreen</button>
+      </div>
+    </section>
   </main>
   <script type="module" src="/static/js/viewer.js"></script>
 </body>

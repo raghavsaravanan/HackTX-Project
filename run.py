@@ -6,9 +6,9 @@ Two listeners share one app (and so one signaling hub and frame buffer):
 
 * https://<lan-ip>:8443  - for the phone. Phones only allow getUserMedia() on secure
   origins, so this uses a self-signed certificate (accept the warning once).
-* http://localhost:8000  - for the laptop viewer. Browsers treat localhost as a secure
-  origin, so no certificate (and no "might be impersonating localhost" warning) is needed.
-  Bound to 127.0.0.1 only, so it is not reachable from the network.
+* http://127.0.0.1:8000  - for the laptop. The hub (http://localhost:5173, `npm run dev`)
+  proxies it for the live viewer, QR code, and frames. Bound to 127.0.0.1 only, so it is
+  not reachable from the network.
 """
 
 from __future__ import annotations
@@ -51,9 +51,8 @@ def main() -> None:
         print(f"Created self-signed certificate in {settings.cert_dir}/")
 
     phone = f"https://{lan_ip()}:{settings.port}/phone"
-    viewer = f"http://localhost:{settings.http_port}/viewer"
-    print("\n  Laptop viewer : " + viewer + "   (open on this Mac)")
-    print("  Phone camera  : " + phone + "   (accept the certificate warning on the phone)\n")
+    print("\n  Laptop hub : http://localhost:5173   (start it with `npm run dev`)")
+    print("  Phone      : " + phone + "   (accept the certificate warning on the phone)\n")
     qr = qrcode.QRCode(border=1)
     qr.add_data(phone)
     qr.print_ascii(invert=True)

@@ -1,274 +1,159 @@
 # Sidequest — HackTX 2026
 
-Everyday tasks become voice-guided quests for blind players. Muse hears, Gemini sees and guides, you conquer.
+Everyday tasks become voice-guided quests for blind players. The phone is a hands-free controller: point its camera at the room and say “Hi Echo, help me tidy my desk.” Muse hears, Gemini sees and guides, you conquer.
 
-The repo holds two apps that share one `.env`:
-
-| App | Language | What it does | Ports |
-| --- | --- | --- | --- |
-| **Sidequest game** (`server/`, `web/`, `shared/`) | Node / TypeScript | Quest planning, per-frame guidance, XP, narration, the laptop hub | API `8787`, hub `5173` (laptop only) |
-| **Phone camera link** (`app/`, `static/`) | Python / FastAPI | Streams the phone camera to the laptop over WebRTC and buffers frames for a vision model | phone `8443` (HTTPS), viewer `8000` |
+## Quick start
 
 ```bash
-cp .env.example .env   # one file configures both apps; blank keys fall back to mock mode
-```
-
----
-
-## Sidequest game (Node)
-
-```bash
+cp .env.example .env            # one file configures both apps; blank keys fall back to mock mode
 npm install
-npm run dev            # game API on :8787, laptop hub on http://localhost:5173
-.venv/bin/python run.py   # phone camera server (setup below)
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+npm run dev                     # game API on 127.0.0.1:8787 + laptop hub on http://localhost:5173
+.venv/bin/python run.py         # camera server: phone on https://<lan-ip>:8443, laptop side on 127.0.0.1:8000
 ```
 
-**One laptop link: `http://localhost:5173`.** It has four tabs:
+Open **`http://localhost:5173`** on the laptop, which is the only laptop link. Scan the QR code on its Connect phone tab with the phone, on the same Wi-Fi, and accept the certificate warning once. Without any API keys, everything runs on scripted mock vision so you can rehearse the demo.
+
+## The journey
+
+The agent is called **Echo** (`AGENT_NAME`).
+
+1. Start both apps and open the hub on the laptop.
+2. Scan the QR code on the Connect phone tab.
+3. Tap **Start** on the phone. This is the only tap: it turns on the camera and microphone and keeps the screen awake. The hub switches to the Quest tab when frames arrive.
+4. Say **“Hi Echo, help me tidy my desk.”** The Vision Agent surveys the room, and the Quest Agent builds a quest from what it actually sees and speaks the first step. “Hi Echo” on its own gets a chime and a “Yes?”.
+5. Follow the voice. Beeps speed up and pan toward the target. Say “I'm done” after a step, or ask “is the room clean?” or “where are my headphones?”.
+6. For 20 seconds after the wake phrase or a reply (`AWAKE_MS`), follow-ups need no wake phrase. Starting a new quest always needs it, so nearby chatter can't replace the quest.
+
+The phone also has a type box for loud rooms; typed text needs no wake phrase.
+
+## The laptop hub
 
 | Tab | What it shows |
 | --- | --- |
 | Connect phone | The QR code that opens the phone controller, plus a pairing checklist |
-| Quest | The projector view: what the AI sees, the quest, the quest map, Vision Agent verdicts, XP, subtitles |
-| Live camera | The full-rate WebRTC video from the phone (the camera server's viewer, proxied) |
+| Quest | The projector view: what the AI sees (with boxes), the quest, the quest map, Vision Agent verdicts, XP, subtitles |
+| Live camera | The full-rate WebRTC video from the phone |
 | APIs | Which service does which job, and the model each one is using right now |
 
-The hub proxies the camera server (`/viewer`, `/ws/*`, `/api/qr.svg`, `/api/info`, `/api/frames*`) and the game API (`/api/*`), so nothing else needs opening. Without any keys, everything runs on scripted mock vision so you can rehearse the demo.
+Vite serves the hub and proxies both backends, so nothing else needs opening: the camera server for `/viewer`, `/ws/*`, `/api/qr.svg`, `/api/info`, and `/api/frames*`, and the game API for every other `/api/*` route.
 
-### The journey
+## How it fits together
 
-The phone is the controller, and it is hands-free. The agent is called **Echo** (`AGENT_NAME`).
+```
+ Phone (https://<lan-ip>:8443/phone)          Camera server (Python, app/)            Game API (Node, server/)
+ ─────────────────────────────────           ─────────────────────────────           ────────────────────────
+ camera ── WebRTC video (LAN, P2P) ─────────────────────────────────────────────►  hub Live camera tab
+ camera ── 1 JPEG/s ── WS /ws/frames ──────► frame buffer ◄── polled ─────────────── Vision Agent (Gemini)
+ mic ── voice detector ── WAV ── POST /api/game/voice ──► proxy ──► POST /api/voice/listen ── Muse transcribe
+ type box ────────────── POST /api/game/text ──► proxy ──► POST /api/say                        │
+ speaker ◄── narration, beeps ◄── GET /api/game/events ◄── proxy ◄── session events ◄── Quest Agent (Gemini)
+```
 
-1. Start both apps and open `http://localhost:5173` on the laptop.
-2. Scan the QR code on the Connect phone tab. Accept the certificate warning once.
-3. Tap **Start** on the phone, the only tap needed. It turns on the camera and the microphone and keeps the screen awake. The hub switches to the Quest tab when frames arrive.
-4. Say **“Hi Echo, help me tidy my desk.”** The Vision Agent surveys the room, and the Quest Agent builds a quest from what it sees and speaks the first step. “Hi Echo” on its own gets a chime and a “Yes?”.
-5. Follow the voice. Beeps speed up and pan toward the target. Say “I'm done” after a step, or ask “is the room clean?” or “where are my headphones?”.
-6. For 20 seconds after the wake phrase or a reply (`AWAKE_MS`), follow-ups need no wake phrase. Starting a new quest always needs it, so nearby chatter can't replace the quest.
-
-How listening works: the phone runs a small voice detector, so only speech is sent, one utterance at a time, while the phone's own voice is muted from the mic. Each utterance goes to Muse Voice Transcribe with the agent's name and the quest's objects as keywords. The server checks for the wake phrase and drops everything else. There is a type box for loud rooms; typed text needs no wake phrase. The scripted presets (`POST /api/quest/start` with a `presetId`) remain a demo safety net.
-
-### Agents and models
-
-| Job | Model | Where |
-| --- | --- | --- |
-| Speech to text | Muse Voice Transcribe (`/v1/asr/transcribe`, 16 kHz WAV), with the agent's name and the quest's objects as keywords | `server/providers/muse.ts`, `server/index.ts` |
-| Wake phrase (“Hi Echo”) and the awake window | No model; a pattern match on each transcript | `server/wake.ts`, `hearUtterance` in `server/session.ts` |
-| **Quest Agent**: plans quests (each mission gets a vision `check`), narrates step by step, gives hints, answers questions, asks the Vision Agent to look, updates mission statuses and the quest map | Gemini (`GEMINI_QUEST_MODEL`, else `GEMINI_MODEL`) | `server/questAgent.ts`, `server/llm.ts`, `server/prompts.ts` |
-| **Vision Agent**: per-frame step observations, scene scans, and yes/no checks answered `PASS` / `FAIL` / `UNCERTAIN` with evidence | Gemini (`GEMINI_VISION_MODEL`, else `GEMINI_MODEL`) | `server/vision.ts` |
-| Fallback brain and eyes | Muse Spark (`muse-spark-1.3`), used automatically when Gemini is missing or fails (quota, overload, timeout) | `server/llm.ts`, `server/vision.ts` |
-| Narrator voice and directional beeps | The phone's `speechSynthesis` and Web Audio | `static/js/voice.js` |
-
-How the agents work together:
-
-- **Verified progress.** When the frame loop thinks a step is done, the mission turns `verifying` and the Vision Agent answers that mission's `check`. `PASS` awards XP and advances. `FAIL` or `UNCERTAIN` sends the verdict and evidence back to the Quest Agent, which marks the mission `retry` and speaks a correction. A PASS/FAIL below 0.55 confidence counts as UNCERTAIN. Set `VERIFY_STEPS=0` to trust the frame loop alone.
-- **Questions.** "Is the room clean?", "Where is the trash can?", or "I'm done" become an `ask` intent. The Quest Agent either answers from quest state or names one yes/no question for the Vision Agent, then reacts to the verdict. Only a Vision Agent `PASS` can complete a mission.
-- **Recognized surroundings, not presets.** Every few seconds (`SURVEY_INTERVAL_MS`) the Vision Agent surveys the live camera frame: a one-sentence description of the place plus every object it can actually see. These become the map's landmarks and the Quest Agent's picture of the room. Planned quests may only use objects the camera saw (or ones the player names). The scripted presets remain as a demo safety net, but their map is also filled from what the camera sees.
-- **Quest map.** The stage shows recognized objects as landmarks, missions as numbered nodes on a route, and where the player is. Nodes update as the camera spots objects and as the Quest Agent pins notes. Tap a mission to re-verify it, or a landmark to ask where it is. After victory the Vision Agent runs the quest's `goalCheck` once and pins the verdict on the map.
-- **One vision call at a time.** Frames are analyzed about once a second, and a surroundings survey runs every 15 seconds. A Gemini quota error (429) pauses Gemini for 30 seconds and Muse Spark takes over, so vision traffic can't crowd out transcription.
-
-**API keys stay on the server.** They are read from `.env` (gitignored) by the Node API only, sent in headers (never URLs), and scrubbed from logs and error responses. Vite exposes nothing to the browser. In dev the API binds to `127.0.0.1` behind the Vite proxy, so other devices on the network can't spend your quota.
+The phone only talks to the camera server. That server holds no keys; it forwards game traffic to the game API on `127.0.0.1:8787`, which is the only process that calls external APIs. The game server owns quest progress, step completion, XP, combos, levels, hints, and narration, so the phone and the hub always agree.
 
 ### Which API is used where
 
-The phone only talks to the camera server (port 8443). That server holds no keys; it forwards game traffic to the Node API on `127.0.0.1:8787`, which is the only process that calls out. Keys are read from `.env`, sent in headers, and scrubbed from logs and error responses.
-
-| What happens | External API | Called from |
+| Job | Service | Code |
 | --- | --- | --- |
-| Speech → text | Meta **Muse Voice Transcribe** `POST /v1/asr/transcribe` | `server/providers/muse.ts` |
-| Planning, narration, hints, answers | Google **Gemini** (`GEMINI_QUEST_API_KEY`, `GEMINI_QUEST_MODEL`) | `server/questAgent.ts` via `server/llm.ts` |
-| Seeing frames, surveying the room, PASS/FAIL/UNCERTAIN checks | Google **Gemini** (`GEMINI_VISION_API_KEY`, `GEMINI_VISION_MODEL`) | `server/vision.ts` |
-| Either agent, when its Gemini key is missing, over quota, or unreachable | Meta **Muse Spark** `POST /v1/chat/completions` (`MODEL_API_KEY`) | `server/llm.ts`, `server/vision.ts` |
-| Optional “ask the model” box on the laptop viewer | Local **Llama** (Ollama) | `app/llama.py` |
+| Speech to text | Meta **Muse Voice Transcribe** `POST /v1/asr/transcribe` (16 kHz mono WAV, with the agent's name and the quest's objects as keywords) | `server/providers/muse.ts`, `server/index.ts` |
+| Wake phrase and awake window | No API; a pattern match on each transcript | `server/wake.ts`, `hearUtterance` in `server/session.ts` |
+| **Quest Agent**: plans quests, narrates step by step, gives hints, answers questions, asks the Vision Agent to look, updates mission statuses and the map | Google **Gemini** (`GEMINI_QUEST_API_KEY`, `GEMINI_QUEST_MODEL`) | `server/questAgent.ts`, `server/llm.ts`, `server/prompts.ts` |
+| **Vision Agent**: per-frame step observations, room surveys, yes/no checks answered `PASS` / `FAIL` / `UNCERTAIN` with evidence | Google **Gemini** (`GEMINI_VISION_API_KEY`, `GEMINI_VISION_MODEL`) | `server/vision.ts` |
+| Fallback for either agent when Gemini is missing, over quota, or unreachable | Meta **Muse Spark** `POST /v1/chat/completions` (`MODEL_API_KEY`) | `server/llm.ts`, `server/vision.ts` |
+| Narrator voice | **ElevenLabs** TTS (`ELEVENLABS_API_KEY`) via `GET /api/tts/:id` (cached); browser speech on the phone and hub if no key | `server/providers/elevenlabs.ts`, `server/tts.ts`, `static/js/voice.js`, `web/src/lib/speech.ts` |
+| Directional beeps, voice activity detection | Web Audio on the phone (no API) | `static/js/voice.js` |
+| Live video | WebRTC with a server relay fallback (no API) | `app/signaling.py`, `app/relay.py`, `static/js/phone.js`, `static/js/viewer.js` |
 
-The phone's own calls, all on the camera server:
+### How the agents work together
 
-| Phone does | Camera server | Node API behind it |
+- **Verified progress.** When the frame loop thinks a step is done, the mission turns `verifying` and the Vision Agent answers that mission's `check`. `PASS` awards XP and advances. `FAIL` or `UNCERTAIN` goes back to the Quest Agent, which marks the mission `retry` and speaks a correction. A PASS/FAIL below 0.55 confidence counts as UNCERTAIN. Set `VERIFY_STEPS=0` to trust the frame loop alone.
+- **Questions.** “Is the room clean?”, “Where is the trash can?”, or “I'm done” become an `ask` intent. The Quest Agent answers from quest state or names one yes/no question for the Vision Agent, then reacts to the verdict. Only a Vision Agent `PASS` can complete a mission.
+- **Recognized surroundings, not presets.** Every `SURVEY_INTERVAL_MS` (15 s) the Vision Agent surveys the newest frame: one sentence describing the place plus every object it can see. These become the map's landmarks. Planned quests may only use objects the camera saw or the player named.
+- **Quest map.** Recognized objects are landmarks, missions are numbered nodes on a route, and the player's position is marked. Tap a mission to re-verify it, or a landmark to ask where it is. After victory the Vision Agent runs the quest's `goalCheck` once.
+- **Efficiency.** Frames arrive about once a second. Vision uses two lanes: player-driven scans (`inspect`, planning, describe) jump ahead of background frame work, and background observations are dropped when the player is waiting. A Gemini quota error (429) can pause Gemini for five minutes while Muse Spark takes over. The phone only sends audio when its voice detector hears speech, and mutes the mic while Echo is talking.
+
+**API keys stay on the laptop.** They are read from `.env` (gitignored) by the game API only, sent in headers (never URLs), and scrubbed from logs and error responses. The game API and the camera server's laptop side bind to `127.0.0.1`, so other devices on the network can't spend your quota.
+
+## Configuration
+
+Everything lives in `.env`; `.env.example` documents each variable. The ones you are most likely to change:
+
+| Variable | Default | Effect |
 | --- | --- | --- |
-| Each spoken utterance (16 kHz mono WAV) | `POST /api/game/voice` | `POST /api/voice/listen` → transcribe, then act only after the wake phrase |
-| Type instead | `POST /api/game/text` | `POST /api/say` → act on the text, no wake phrase |
-| Listen for narration, verdicts, the quest | `GET /api/game/events` | `GET /api/session/:id/events?role=phone` |
-| One JPEG a second | `WS /ws/frames` | polled from `GET /api/frames/latest` on the camera server |
+| `MODEL_API_KEY` | | Meta Muse key (transcription and fallback brain) |
+| `GEMINI_QUEST_API_KEY`, `GEMINI_VISION_API_KEY` | `GEMINI_API_KEY` | Per-agent Gemini keys (separate quotas) |
+| `GEMINI_QUEST_MODEL`, `GEMINI_VISION_MODEL` | `GEMINI_MODEL` | Per-agent Gemini models |
+| `AGENT_NAME` | `Echo` | Wake phrase is “Hi <name>”; narration persona uses this name |
+| `ELEVENLABS_API_KEY` | | Cloud narrator voice; blank uses on-device speech |
+| `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | premade + `eleven_flash_v2_5` | ElevenLabs voice and low-latency model |
+| `AWAKE_MS` | `20000` | How long follow-ups need no wake phrase |
+| `VERIFY_STEPS` | `1` | `0` skips Vision Agent confirmation of each step |
+| `SURVEY_INTERVAL_MS` | `15000` | How often the room is re-surveyed for the map |
+| `SIDEQUEST_SESSION` | `demo` | Game session the phone joins (or `?session=` on the phone URL) |
 
-`POST /api/frame` still accepts frames pushed directly at the Node API, and `POST /api/vision/check` plus `POST /api/mission/verify` ask the Vision Agent on demand. The hub's Quest tab uses the event stream with `?role=stage`.
-
-The server owns quest progress, step completion, XP, combos, levels, hints, and narration, so the phone and stage always agree.
-
-### Demo checklist
-
-- Stage the desk with the preset objects: water bottle, trash can, book, backpack.
-- Use the `desk` preset as the safety net if live planning misbehaves.
-- Run the demo on a phone hotspot, not venue Wi-Fi.
-- Click "Enable stage sound" on the Quest tab so the audience hears rewards.
-
----
-
-## Phone camera link (Python, WebRTC)
-
-Stream your phone's camera to your MacBook's browser over your local Wi-Fi using
-WebRTC, then feed the frames to a vision-capable Llama model (Llama 3.2 Vision
-via Ollama, vLLM, llama.cpp, or any OpenAI-compatible host).
+## Project layout
 
 ```
- ┌──────────── Phone browser ─────────────┐                 ┌──────────── MacBook ────────────────────────────────┐
- │ getUserMedia() ─► RTCPeerConnection ───┼── WebRTC (LAN) ─┼─► RTCPeerConnection ─► <video>  (viewer page)       │
- │                         ▲              │   video, P2P    │        ▲                   │ canvas snapshot (JPEG)  │
- └─────────────────────────┼──────────────┘                 │        │                   ▼                         │
-                           │  offer/answer/ICE (wss)        │  FastAPI ◄── /ws/frames ── frames                    │
-                           └────────────────────────────────┼─► /ws/signal   FrameBuffer: RGB, ≤1120px, JPEG, b64  │
-                                                            │                   │                                  │
-                                                            │                   ▼  /api/analyze                    │
-                                                            │       Llama vision model (OpenAI-compatible API)     │
-                                                            └──────────────────────────────────────────────────────┘
-```
-
-* **Media path:** phone → laptop browser, direct peer-to-peer on the LAN (no STUN/TURN,
-  nothing leaves your network). FastAPI only relays the signaling messages.
-* **Frame path:** the viewer page samples the live `<video>` at a configurable rate
-  (0.5–10 fps), sends JPEG snapshots over a WebSocket, and the server normalises them
-  for Llama: EXIF-rotated, RGB, longest side ≤ 1120 px (Llama 3.2 Vision's 2×2 grid of
-  560 px tiles), re-encoded as JPEG and base64 `data:` URLs ready for an `image_url`
-  content part.
-
-### Requirements
-
-* macOS with Python 3.10+ (tested with 3.14)
-* Phone and MacBook on **the same Wi-Fi network** (guest networks with "client
-  isolation" block device-to-device traffic, so avoid those). A phone hotspot works.
-* Phone browser: iOS Safari 14.3+ or Android Chrome
-* Optional, for the model: [Ollama](https://ollama.com) (`brew install ollama`)
-
-### Setup
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python run.py
-```
-
-`run.py` starts two listeners on the same app:
-
-```
-  Laptop viewer : http://localhost:8000/viewer     (open on this Mac)
-  Phone camera  : https://192.168.1.23:8443/phone  (accept the certificate warning on the phone)
-```
-
-* The **viewer** uses plain `http://localhost` — browsers treat localhost as a secure origin,
-  so there's no certificate and no *"might be impersonating localhost"* warning. It only
-  listens on `127.0.0.1`, so nothing else on the network can reach it.
-* The **phone** needs `https://` (phones only allow camera access on secure pages), so
-  `run.py` creates a self-signed certificate in `certs/` on first start. The cert is
-  machine-specific and is not committed.
-
-1. **On the MacBook**, open `http://localhost:8000/viewer`.
-2. **On the phone**, scan the QR code shown on the viewer page (or in the terminal). On the
-   *"Your connection is not private"* page tap **Show Details → visit this website** (Safari) or
-   **Advanced → Proceed** (Chrome). Then tap **Start camera** and allow camera access.
-3. The video appears on the laptop within a second or two. Use **Flip camera** to switch
-   between rear and front cameras, and the resolution menu for 480p/720p/1080p.
-
-If macOS asks whether Python may accept incoming network connections, click **Allow**.
-
-Use `?room=<name>` on both URLs to run several phone/laptop pairs on one server.
-
-### Using the frames with Llama
-
-#### 1. Run a Llama vision model locally (Ollama)
-
-```bash
-ollama pull llama3.2-vision     # 11B, ~8 GB; fine on Apple Silicon with 16 GB+ RAM
-ollama serve                    # if the Ollama app isn't already running
-```
-
-The defaults in `.env.example` already point at Ollama's OpenAI-compatible endpoint
-(`http://localhost:11434/v1`, model `llama3.2-vision`). For another backend, change
-`LLAMA_BASE_URL`, `LLAMA_MODEL` and `LLAMA_API_KEY` — e.g. vLLM serving
-`meta-llama/Llama-3.2-11B-Vision-Instruct`, a llama.cpp server, LM Studio, or a hosted
-provider such as Groq or Together that serves Llama vision weights.
-
-#### 2. Stream frames and ask questions
-
-On the viewer page tick **Send frames to server**, pick a rate, then type a prompt under
-**Ask the vision model**. Ollama's `llama3.2-vision` accepts one image per request, so keep
-*Frames* at 1 unless your backend supports multiple images.
-
-#### 3. Use the frames from your own code
-
-| Endpoint | What you get |
-|---|---|
-| `GET /api/frames/latest` | Newest prepared frame: `frame_id`, `timestamp`, size, `base64`, `data_url` |
-| `GET /api/frames/latest.jpg` | Newest prepared frame as a JPEG |
-| `GET /api/frames?limit=10` | Metadata for the buffered frames |
-| `GET /api/frames/{id}.jpg` | A specific buffered frame |
-| `POST /api/analyze` | `{"prompt": "...", "num_frames": 1}` → `{"answer": "..."}` from the Llama model |
-| `WS /ws/frames` | Push your own JPEG/PNG bytes in; get frame metadata back |
-
-Interactive docs are at `http://localhost:8000/docs`.
-
-```bash
-curl http://localhost:8000/api/frames/latest.jpg -o frame.jpg
-curl -X POST http://localhost:8000/api/analyze \
-     -H 'Content-Type: application/json' \
-     -d '{"prompt": "What objects are on the table?"}'
-```
-
-`scripts/llama_watch.py` is a ready-made loop that asks the model about the newest frame
-every few seconds:
-
-```bash
-python scripts/llama_watch.py --prompt "Is anyone in the frame?" --every 5
-```
-
-In Python, `app.frames.PreparedFrame` gives you `.jpeg`, `.base64`, `.data_url` and
-`.to_pil()`, and `app.llama.build_messages(prompt, frames)` builds the OpenAI-style message
-list. Set `SAVE_FRAMES_DIR=captures` in `.env` to also write every frame to disk (for
-datasets or offline batch inference).
-
-### Project layout
-
-```
-app/
-  main.py        FastAPI routes: pages, signaling + frame WebSockets, frame/analyze API
-  signaling.py   Room-based offer/answer/ICE relay (one phone + one viewer per room)
-  relay.py       Fallback video: phone JPEG frames forwarded to viewers over WebSocket
-  frames.py      Frame ring buffer and Llama-oriented preprocessing
-  llama.py       OpenAI-compatible client for a Llama vision model
-  network.py     LAN IP detection and self-signed certificate generation
-  config.py      Settings from environment / .env
-static/
-  phone.html, js/phone.js      getUserMedia + WebRTC sender
-  viewer.html, js/viewer.js    WebRTC receiver, frame sampler, "ask the model" panel
+server/                 Game API (Node / TypeScript)
+  index.ts              HTTP routes, camera-link polling, survey timer
+  session.ts            Session state: quests, missions, frame loop, wake-phrase listening, events
+  questAgent.ts         Quest Agent: plan, narrate, hint, answer, react to verdicts, intent parsing
+  vision.ts             Vision Agent: step observations, room scans, PASS/FAIL/UNCERTAIN checks
+  llm.ts                Quest Agent model calls (Gemini, Muse Spark fallback)
+  prompts.ts            All system prompts and JSON schemas
+  providers/            gemini.ts, muse.ts (chat + Voice Transcribe)
+  wake.ts               Wake phrase matching
+  map.ts                Quest map: landmarks, routes, player position
+  guidance.ts           Pan / proximity / phase for directional cues
+  game.ts               XP, combos, levels
+  cameraLink.ts         Reads the newest phone frame from the camera server
+  presets.ts, mock.ts   Scripted demo quests and mock vision (no keys)
+  config.ts, util.ts
+shared/types.ts         Types shared by the game API and the hub
+web/                    Laptop hub (React, Vite)
+  src/hub/Hub.tsx       Tabs: Connect phone, Quest, Live camera, APIs
+  src/stage/            Quest tab (Stage.tsx) and the quest map (QuestMap.tsx)
+  src/lib/              API client, event subscription, stage speech and sound effects
+app/                    Camera server (Python / FastAPI)
+  main.py               Pages, signaling + relay + frame WebSockets, frame API, game proxies
+  signaling.py          Room-based offer/answer/ICE relay (one phone + one viewer per room)
+  relay.py              Fallback video: phone JPEG frames forwarded to the viewer
+  frames.py             Frame ring buffer and preprocessing
+  network.py            LAN IP detection and self-signed certificate
+  config.py             Settings from .env
+static/                 Pages served by the camera server
+  phone.html, js/phone.js, js/voice.js   Phone controller: camera, WebRTC, listening, narration
+  viewer.html, js/viewer.js              Live video (shown in the hub's Live camera tab)
   js/common.js, css/style.css
-scripts/
-  gen_cert.py    Regenerate the HTTPS cert (run after your LAN IP changes)
-  llama_watch.py Periodic frame → Llama example
-tests/           pytest suite (signaling relay, frame ingest, preprocessing)
-run.py           Starts uvicorn with HTTPS and prints the URLs + QR code
+scripts/gen_cert.py     Regenerate the HTTPS certificate (after your LAN IP changes)
+tests/test_app.py       Camera server tests (signaling, relay, frames, game proxies)
+run.py                  Starts the camera server's HTTPS and HTTP listeners
 ```
 
-### Troubleshooting
-
-* **"Camera API unavailable" on the phone** – the page isn't on a secure origin. Use the
-  `https://` URL and accept the certificate warning.
-* **"This website might be impersonating localhost"** – you opened `https://localhost:8443`.
-  Use `http://localhost:8000/viewer` on the Mac instead (or click *Advanced → Proceed*).
-* **Certificate errors after switching networks** – your LAN IP changed; run
-  `python scripts/gen_cert.py` and restart. (Or install [mkcert](https://github.com/FiloSottile/mkcert),
-  generate `certs/cert.pem`/`certs/key.pem` with it, and trust its root CA on the phone to
-  get rid of the warning.)
-* **Stuck on "WebRTC: connecting" / "failed"** – both devices must be on the same Wi-Fi
-  without client isolation, and VPNs on either device should be off. While the direct link
-  is down, the phone falls back to sending ~8 fps JPEG frames through the server
-  (`/ws/relay/{room}`), and the status shows "via server relay". Open the phone page with
-  `?mode=relay` to skip WebRTC entirely on networks that block device-to-device traffic.
-* **Black video on iPhone after locking the screen** – iOS pauses the camera in background
-  tabs; unlock and tap *Restart camera*.
-* **`/api/analyze` returns 502** – the Llama backend isn't reachable; check `ollama serve` is
-  running and `ollama list` shows `llama3.2-vision`.
-
-### Tests
+## Development
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+npm run typecheck                      # TypeScript
+npm run build                          # check the hub builds (output in dist/, unused at runtime)
+.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest
 ```
+
+The camera server's interactive API docs are at `http://localhost:8000/docs`.
+
+## Demo checklist
+
+- Run the demo on a phone hotspot, not venue Wi-Fi.
+- Stage the desk with a few clear objects (water bottle, trash can, book, backpack).
+- If live planning misbehaves, start a scripted quest: `curl -X POST localhost:8787/api/quest/start -H 'Content-Type: application/json' -d '{"sessionId":"demo","presetId":"desk"}'` (`GET /api/presets` lists them).
+- Click “Enable stage sound” on the Quest tab so the audience hears rewards.
+
+## Troubleshooting
+
+* **“Camera API unavailable” on the phone.** The page isn't on a secure origin. Use the `https://` URL and accept the certificate warning.
+* **Certificate errors after switching networks.** Your LAN IP changed; run `.venv/bin/python scripts/gen_cert.py` and restart. (Or generate `certs/cert.pem` and `certs/key.pem` with [mkcert](https://github.com/FiloSottile/mkcert) and trust its root CA on the phone.)
+* **Stuck on “WebRTC: connecting” or “failed”.** Both devices must be on the same Wi-Fi without client isolation, with VPNs off. While the direct link is down, the phone sends ~8 fps JPEG frames through the server and the status shows “via server relay”. Add `?mode=relay` to the phone URL to skip WebRTC entirely.
+* **Echo doesn't react.** The phone's status line shows what it heard. Start with “Hi Echo”, and check that “Listen for the wake phrase” is on under Settings. A “Voice failed” message means the game API (`npm run dev`) isn't running or Muse is unreachable.
+* **Black video on iPhone after locking the screen.** iOS pauses the camera in background tabs; unlock and tap Restart camera.
+* **macOS asks whether Python may accept incoming connections.** Click Allow.

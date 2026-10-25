@@ -1,44 +1,34 @@
 import express, { type NextFunction, type Request, type Response } from "express";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import type {
-  AskRequest,
-  CommandRequest,
-  FrameRequest,
-  MissionVerifyRequest,
-  StartQuestRequest,
-  VisionCheckRequest,
-  VoiceResponse,
-} from "../shared/types.ts";
+import type { AskRequest, MissionVerifyRequest, StartQuestRequest, VoiceResponse } from "../shared/types.ts";
 import { cameraLinkEnabled, cameraLinkStatus } from "./cameraLink.ts";
-import { config, hasGemini, hasMuse, questMode, redact, visionMode } from "./config.ts";
+import { config, hasElevenLabs, hasGemini, hasMuse, questMode, redact, visionMode } from "./config.ts";
+import { speakLineAudio } from "./tts.ts";
 import { PRESETS } from "./presets.ts";
+import { geminiStatus } from "./providers/gemini.ts";
 import { museTranscribe } from "./providers/muse.ts";
+import { visionQueueStatus } from "./vision.ts";
 import { parseIntent } from "./questAgent.ts";
 import { wakeKeywords, wakePhrase } from "./wake.ts";
 import {
   askQuestion,
   dispatchIntent,
   getSession,
-  handleFrame,
   hearUtterance,
   planFromGoal,
   pollCameraLink,
   recordTranscript,
-  runCommand,
   snapshot,
   startQuest,
   subscribe,
   surveySurroundings,
   trackPipeline,
   verifyMission,
-  visionCheck,
 } from "./session.ts";
 import { errorDetail, timed, uid } from "./util.ts";
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "64kb" }));
 
 const asyncRoute =
   (fn: (req: Request, res: Response) => Promise<void>) => (req: Request, res: Response, next: NextFunction) =>
@@ -53,9 +43,16 @@ app.get(
       agent: { name: config.agent.name, wakePhrase: wakePhrase() },
       muse: hasMuse() ? config.muse.model : "mock",
       transcribe: hasMuse() ? config.muse.transcribeModel : "unavailable",
+      speak: hasElevenLabs() ? `ElevenLabs (${config.elevenlabs.model})` : "on-device",
       vision: modelName(visionMode(), config.gemini.visionModel),
       quest: modelName(questMode(), config.gemini.questModel),
       gemini: hasGemini(),
+      geminiStatus: geminiStatus(),
+      visionNote:
+        geminiStatus().quotaExhausted && (visionMode() === "muse" || questMode() === "muse")
+          ? "Gemini over quota, using Muse Spark (slower)"
+          : null,
+      visionQueue: visionQueueStatus(),
       verifySteps: config.game.verifySteps,
       cameraLink: cameraLinkEnabled() ? await cameraLinkStatus() : null,
     });
@@ -66,25 +63,9 @@ app.get("/api/presets", (_req, res) => {
   res.json(Object.entries(PRESETS).map(([id, p]) => ({ id, title: p.title, type: p.type, steps: p.steps.length })));
 });
 
-app.get("/api/session/:id", (req, res) => {
-  res.json(snapshot(getSession(req.params.id)));
-});
-
 app.get("/api/session/:id/events", (req, res) => {
   subscribe(getSession(req.params.id), res, req.query.role === "stage" ? "stage" : "phone");
 });
-
-app.post(
-  "/api/frame",
-  asyncRoute(async (req, res) => {
-    const body = req.body as FrameRequest;
-    if (!body.sessionId || !body.image) {
-      res.status(400).json({ error: "sessionId and image are required" });
-      return;
-    }
-    res.json(await handleFrame(getSession(body.sessionId), body));
-  }),
-);
 
 app.post(
   "/api/quest/start",
@@ -105,22 +86,12 @@ app.post(
       return;
     }
 
-    const planned = body.goal ? await planFromGoal(s, body.goal, body.image) : null;
+    const planned = body.goal ? await planFromGoal(s, body.goal) : null;
     if (!planned) {
       res.status(400).json({ error: "Provide presetId, or a goal plus a camera frame (start the phone camera first)" });
       return;
     }
     res.json(planned);
-  }),
-);
-
-app.post(
-  "/api/command",
-  asyncRoute(async (req, res) => {
-    const body = req.body as CommandRequest;
-    const s = getSession(body.sessionId);
-    await runCommand(s, body.type, body.image);
-    res.json(snapshot(s));
   }),
 );
 
@@ -133,25 +104,7 @@ app.post(
       res.status(400).json({ error: "sessionId and text are required" });
       return;
     }
-    res.json(await askQuestion(getSession(body.sessionId), body.text.trim().slice(0, 500), body.image));
-  }),
-);
-
-/** Ask the Vision Agent directly: PASS, FAIL, or UNCERTAIN with evidence. */
-app.post(
-  "/api/vision/check",
-  asyncRoute(async (req, res) => {
-    const body = req.body as VisionCheckRequest;
-    if (!body.sessionId || !body.question?.trim()) {
-      res.status(400).json({ error: "sessionId and question are required" });
-      return;
-    }
-    const check = await visionCheck(getSession(body.sessionId), body.question.trim().slice(0, 300), body.image);
-    if (!check) {
-      res.status(502).json({ error: "Vision Agent unavailable" });
-      return;
-    }
-    res.json(check);
+    res.json(await askQuestion(getSession(body.sessionId), body.text.trim().slice(0, 500)));
   }),
 );
 
@@ -161,7 +114,7 @@ app.post(
   asyncRoute(async (req, res) => {
     const body = req.body as MissionVerifyRequest;
     const s = getSession(body.sessionId);
-    const check = await verifyMission(s, body.stepId, body.image);
+    const check = await verifyMission(s, body.stepId);
     if (!check) {
       res.status(s.quest ? 502 : 404).json({ error: s.quest ? "Vision Agent unavailable" : "No active quest" });
       return;
@@ -203,8 +156,30 @@ app.post(
       res.status(503).json({ error: "MODEL_API_KEY not set; type commands instead" });
       return;
     }
+    const t0 = Date.now();
     const transcript = await transcribe(s, req.body as Buffer);
-    res.json(hearUtterance(s, transcript));
+    const response = hearUtterance(s, transcript);
+    console.log(`[listen] ${response.heard} ${Date.now() - t0}ms "${transcript.slice(0, 80)}"`);
+    res.json(response);
+  }),
+);
+
+app.get(
+  "/api/tts/:id",
+  asyncRoute(async (req, res) => {
+    const id = String(req.params.id).slice(0, 64);
+    try {
+      const audio = await speakLineAudio(id);
+      if (!audio) {
+        res.status(404).json({ error: "Unknown line" });
+        return;
+      }
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      res.send(audio);
+    } catch (err) {
+      res.status(502).json({ error: redact((err as Error).message) });
+    }
   }),
 );
 
@@ -227,16 +202,12 @@ app.post(
   }),
 );
 
-if (process.env.NODE_ENV === "production") {
-  const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist");
-  app.use(express.static(dist));
-  app.get(/^\/(?!api\/).*/, (_req, res) => res.sendFile(path.join(dist, "index.html")));
-}
-
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   const detail = redact(errorDetail(err));
   console.error("[api]", detail);
-  const message = /fetch failed/i.test(err.message) ? "The AI service could not be reached. Try again in a moment." : detail;
+  let message = detail;
+  if (/fetch failed/i.test(err.message)) message = "The AI service could not be reached. Try again in a moment.";
+  else if (/Muse Voice Transcribe 429/i.test(detail)) message = "Transcription is busy, try again in a moment.";
   if (!res.headersSent) res.status(500).json({ error: message });
 });
 

@@ -3,8 +3,6 @@ import type {
   AskResponse,
   ListenResponse,
   CommandType,
-  FrameRequest,
-  FrameResponse,
   LineSource,
   MissionState,
   PipelineStage,
@@ -28,12 +26,12 @@ import { computeGuidance } from "./guidance.ts";
 import { anchorLabel, applyNotes, buildMap, findLandmark, markSeen, mergeScene, setPlayerAt } from "./map.ts";
 import { NARRATOR } from "./prompts.ts";
 import { askAgent, describeScene, hint, narrate, parseIntent, planQuest, reactToVerdict, type AgentState, type AgentTurn } from "./questAgent.ts";
+import { cloudVoiceEnabled, registerSpeakLine } from "./tts.ts";
 import { timed } from "./util.ts";
 import { inspect, observeStep, scanScene } from "./vision.ts";
 import { matchWake, wakePhrase } from "./wake.ts";
 
 type Role = "stage" | "phone";
-type FrameSource = "client" | "link";
 
 interface Session {
   id: string;
@@ -45,9 +43,10 @@ interface Session {
   questEndedAt: number | null;
   stats: PlayerStats;
   lastSay: string;
+  lastSayAt: number;
   lastTranscript: string;
-  /** Per source, so console frames and camera-link frames don't reject each other as stale. */
-  lastSeq: Record<FrameSource, number>;
+  /** Sequence of the newest analyzed camera frame; older results are ignored for progression. */
+  lastSeq: number;
   doneStreak: number;
   recent: StepObservation[];
   mockTick: number;
@@ -62,8 +61,6 @@ interface Session {
   surveyFrameId: number;
   verifying: boolean;
   lastVerifyAt: number;
-  lastImage: { image: string; at: number } | null;
-  lastClientFrameAt: number;
   link: { seq: number; frameId: number; inFlight: boolean };
   /** Hands-free listening: follow-ups need no wake phrase until this time. */
   awakeUntil: number;
@@ -87,8 +84,9 @@ export function getSession(id: string): Session {
       questEndedAt: null,
       stats: freshStats(),
       lastSay: "",
+      lastSayAt: 0,
       lastTranscript: "",
-      lastSeq: { client: -1, link: -1 },
+      lastSeq: -1,
       doneStreak: 0,
       recent: [],
       mockTick: 0,
@@ -102,8 +100,6 @@ export function getSession(id: string): Session {
       surveyFrameId: -1,
       verifying: false,
       lastVerifyAt: 0,
-      lastImage: null,
-      lastClientFrameAt: 0,
       link: { seq: 0, frameId: -1, inFlight: false },
       awakeUntil: 0,
       armed: false,
@@ -126,6 +122,7 @@ export function snapshot(s: Session): SessionSnapshot {
     stats: s.stats,
     narratorName: NARRATOR.name,
     wakePhrase: wakePhrase(),
+    cloudVoice: cloudVoiceEnabled(),
     lastTranscript: s.lastTranscript,
     missions: s.missions,
     map: s.map,
@@ -175,9 +172,10 @@ const pushSnapshot = (s: Session) => broadcast(s, { type: "snapshot", snapshot: 
 
 function say(s: Session, text: string, source: LineSource, sfx?: Sfx[], priority = false) {
   s.lastSay = text;
+  s.lastSayAt = Date.now();
   // A reply keeps the conversation open so the player can answer without the wake phrase.
   if (Date.now() < s.awakeUntil) s.awakeUntil = Date.now() + config.agent.awakeMs;
-  broadcast(s, { type: "say", text, source, sfx, priority });
+  broadcast(s, { type: "say", id: registerSpeakLine(text), text, source, sfx, priority });
 }
 
 async function narrateTracked(s: Session, event: string, details: string, fallback: string) {
@@ -211,15 +209,11 @@ function applyTurn(s: Session, turn: AgentTurn): boolean {
   return changed;
 }
 
-// ---------- Frame sources ----------
+// ---------- Frames ----------
 
-/** Best frame for an on-demand check: the caller's, then the live camera link, then the console's last frame. */
-export async function resolveFrame(s: Session, provided?: string): Promise<string | null> {
-  if (provided) return provided;
-  const linked = await fetchCameraFrame();
-  if (linked) return linked.image;
-  if (s.lastImage && Date.now() - s.lastImage.at < config.cameraLink.maxAgeMs) return s.lastImage.image;
-  return null;
+/** The phone's newest frame from the camera server, or null when the camera is off. */
+async function cameraFrame(): Promise<string | null> {
+  return (await fetchCameraFrame())?.image ?? null;
 }
 
 // ---------- Quest lifecycle ----------
@@ -258,18 +252,18 @@ export function startQuest(s: Session, quest: Quest, source: LineSource, scene: 
   say(s, `${quest.intro} ${quest.steps[0].instruction}`, source, ["start"], true);
 }
 
-export function setPlanning(s: Session, transcript?: string) {
+function setPlanning(s: Session, transcript?: string) {
   s.status = "planning";
   if (transcript) s.lastTranscript = transcript;
   pushSnapshot(s);
-  say(s, "Let me survey the realm. Hold the phone steady.", "system", undefined, true);
+  say(s, "Give me a moment to look around. Hold the phone steady.", "system", undefined, true);
 }
 
-export function planningFailed(s: Session, message: string) {
+function planningFailed(s: Session, message: string) {
   s.status = s.quest ? "active" : "idle";
   pushSnapshot(s);
   broadcast(s, { type: "pipeline", stage: "plan", status: "error", detail: redact(message) });
-  say(s, "My crystal ball clouded over. Try asking again.", "system", ["fail"], true);
+  say(s, "I couldn't get a clear look. Try asking again.", "system", ["fail"], true);
 }
 
 export function recordTranscript(s: Session, text: string) {
@@ -340,7 +334,7 @@ function finishQuest(s: Session, quest: Quest) {
 /** After victory, the Vision Agent checks the whole goal once and pins the verdict on the map. */
 async function finalInspection(s: Session, quest: Quest) {
   if (!quest.goalCheck) return;
-  const image = await resolveFrame(s);
+  const image = await cameraFrame();
   if (!image) return;
   const check = await runCheck(s, quest.goalCheck, image, `The player just finished the quest "${quest.title}".`, "goal");
   if (!check || s.quest?.id !== quest.id) return;
@@ -424,12 +418,11 @@ async function verifyStep(s: Session, step: QuestStep, image: string) {
 }
 
 /** Player tapped a mission on the quest map (or asked to re-check one). */
-export async function verifyMission(s: Session, stepId: string, image?: string): Promise<VisionCheck | null> {
+export async function verifyMission(s: Session, stepId: string): Promise<VisionCheck | null> {
   const index = s.quest?.steps.findIndex((step) => step.id === stepId) ?? -1;
   if (!s.quest || index < 0) return null;
   const step = s.quest.steps[index];
-  const frame = await resolveFrame(s, image);
-  const check = await runCheck(s, step.check, frame, `Mission: ${step.action} the ${step.target}. ${step.success}`, step.id);
+  const check = await runCheck(s, step.check, await cameraFrame(), `Mission: ${step.action} the ${step.target}. ${step.success}`, step.id);
   if (!check) return null;
   const isCurrent = index === s.stepIndex && s.status === "active";
   if (isCurrent && check.verdict === "PASS") {
@@ -449,14 +442,9 @@ export async function verifyMission(s: Session, stepId: string, image?: string):
   return check;
 }
 
-/** A free-form check ("Is the room clean?") that isn't tied to a mission. */
-export async function visionCheck(s: Session, question: string, image?: string): Promise<VisionCheck | null> {
-  return runCheck(s, question, await resolveFrame(s, image), s.quest ? `Quest: ${s.quest.title}` : "", null);
-}
-
 // ---------- Quest Agent conversation ----------
 
-export async function askQuestion(s: Session, text: string, image?: string): Promise<AskResponse> {
+export async function askQuestion(s: Session, text: string): Promise<AskResponse> {
   if (s.lastTranscript !== text) recordTranscript(s, text);
   trackPipeline(s, "agent", "start");
   const started = Date.now();
@@ -471,7 +459,7 @@ export async function askQuestion(s: Session, text: string, image?: string): Pro
   if (first.visionQuestion) {
     const step = currentStep(s);
     const isMission = !!step && s.status === "active" && first.visionQuestion === step.check;
-    check = await runCheck(s, first.visionQuestion, await resolveFrame(s, image), `The player asked: "${text}"`, isMission ? step.id : null);
+    check = await runCheck(s, first.visionQuestion, await cameraFrame(), `The player asked: "${text}"`, isMission ? step.id : null);
     if (check) {
       const second = await reactToVerdict(agentState(s), `The player said: "${text}"`, check);
       reply = second.reply || check.summary;
@@ -487,52 +475,57 @@ export async function askQuestion(s: Session, text: string, image?: string): Pro
         changed = true;
       }
     } else {
-      reply = "My scrying glass flickered. Ask me again in a moment.";
+      reply = "I lost the picture for a second. Ask me again in a moment.";
       source = "system";
     }
   }
   trackPipeline(s, "agent", "done", Date.now() - started, source);
   if (changed) pushSnapshot(s);
-  reply ||= "I am here, hero. What would you like to do?";
+  reply ||= "I'm here. What would you like to do?";
   if (!missionCompleted) say(s, reply, source, undefined, true);
   return { reply, source, check, missionCompleted, snapshot: snapshot(s) };
 }
 
-// ---------- Frames ----------
-
-export async function handleFrame(s: Session, req: FrameRequest, source: FrameSource = "client"): Promise<FrameResponse> {
+/** One camera frame through the frame loop: guidance for the phone, boxes for the stage, step progress. */
+async function handleFrame(s: Session, seq: number, image: string): Promise<void> {
   const step = currentStep(s);
-  const base = { seq: req.seq, stepCompleted: null, questCompleted: false };
-  s.lastImage = { image: req.image, at: Date.now() };
-  if (source === "client") s.lastClientFrameAt = Date.now();
 
   if (s.status !== "active" || !step) {
     const guidance = computeGuidance(null, null);
-    broadcast(s, { type: "frame", image: req.image, observation: null, guidance, timing: null }, "stage");
-    return { ...base, observation: null, guidance, timing: null, snapshot: snapshot(s) };
+    broadcast(s, { type: "frame", image: image, observation: null, guidance, timing: null }, "stage");
+    return;
   }
 
   s.mockTick++;
   let result: Awaited<ReturnType<typeof observeStep>>;
   try {
-    result = await observeStep(req.image, step, s.mockTick);
+    result = await observeStep(image, step, s.mockTick);
+    if (!result) return;
   } catch (err) {
     const message = redact((err as Error).message);
     console.warn("[frame]", message.slice(0, 160));
     broadcast(s, { type: "pipeline", stage: "vision", status: "error", detail: message.slice(0, 80) });
-    return { ...base, observation: null, guidance: computeGuidance(null, null), timing: null, snapshot: snapshot(s) };
+    return;
   }
   const { observation, timing } = result;
   const guidance = computeGuidance(step, observation);
-  broadcast(s, { type: "frame", image: req.image, observation, guidance, timing }, "stage");
-  broadcast(s, { type: "guide", guidance }, "phone");
+  broadcast(s, { type: "frame", image: image, observation, guidance, timing }, "stage");
+  broadcast(
+    s,
+    {
+      type: "guide",
+      guidance,
+      speakId: guidance.say ? registerSpeakLine(guidance.say) : undefined,
+    },
+    "phone",
+  );
 
   // Ignore results for a step that already ended, or that arrived out of order.
   const stillCurrent = currentStep(s)?.id === step.id && s.status === "active";
-  if (!stillCurrent || req.seq <= s.lastSeq[source]) {
-    return { ...base, observation, guidance, timing, snapshot: snapshot(s) };
+  if (!stillCurrent || seq <= s.lastSeq) {
+    return;
   }
-  s.lastSeq[source] = req.seq;
+  s.lastSeq = seq;
   s.recent = [...s.recent.slice(-5), observation];
 
   let mapChanged = false;
@@ -547,37 +540,23 @@ export async function handleFrame(s: Session, req: FrameRequest, source: FrameSo
   const done = (observation.stepDone && observation.confidence >= instantDoneConfidence) || s.doneStreak >= 2;
 
   if (done && shouldVerify()) {
-    if (!s.verifying && Date.now() - s.lastVerifyAt >= config.game.verifyCooldownMs) void verifyStep(s, step, req.image);
+    if (!s.verifying && Date.now() - s.lastVerifyAt >= config.game.verifyCooldownMs) void verifyStep(s, step, image);
     else if (mapChanged) pushSnapshot(s);
-    return { ...base, observation, guidance, timing, snapshot: snapshot(s) };
+    return;
   }
 
   if (done) {
-    const reward = completeStep(s);
-    return {
-      ...base,
-      observation,
-      guidance,
-      timing,
-      stepCompleted: { stepId: step.id, reward },
-      questCompleted: currentStep(s) === null,
-      snapshot: snapshot(s),
-    };
+    completeStep(s);
+    return;
   }
 
   if (mapChanged) pushSnapshot(s);
   maybeHint(s, step);
-  return { ...base, observation, guidance, timing, snapshot: snapshot(s) };
 }
 
-/**
- * Feed the Python camera link's newest frame into every active quest whose console isn't
- * sending its own frames, so the phone-to-laptop stream alone can drive the game.
- */
+/** Feed the camera server's newest phone frame into every active quest. */
 export async function pollCameraLink() {
-  const idle = [...sessions.values()].filter(
-    (s) => s.status === "active" && !s.link.inFlight && Date.now() - s.lastClientFrameAt > config.cameraLink.maxAgeMs,
-  );
+  const idle = [...sessions.values()].filter((s) => s.status === "active" && !s.link.inFlight);
   if (!idle.length) return;
   const frame = await fetchCameraFrame();
   if (!frame) return;
@@ -585,7 +564,7 @@ export async function pollCameraLink() {
     if (frame.frameId === s.link.frameId) continue;
     s.link.frameId = frame.frameId;
     s.link.inFlight = true;
-    void handleFrame(s, { sessionId: s.id, seq: ++s.link.seq, image: frame.image }, "link").finally(() => {
+    void handleFrame(s, ++s.link.seq, frame.image).finally(() => {
       s.link.inFlight = false;
     });
   }
@@ -594,13 +573,15 @@ export async function pollCameraLink() {
 // ---------- Planning and voice dispatch ----------
 
 /** Survey the surroundings, then have the Quest Agent plan a quest for `goal`. Returns null when there is no camera frame. */
-export async function planFromGoal(s: Session, goal: string, provided?: string): Promise<SessionSnapshot | null> {
-  const image = await resolveFrame(s, provided);
+export async function planFromGoal(s: Session, goal: string): Promise<SessionSnapshot | null> {
+  const image = await cameraFrame();
   if (!image) return null;
   setPlanning(s, goal);
   try {
     trackPipeline(s, "vision", "start");
-    const { scene, timing } = await scanScene(image);
+    const scanned = await scanScene(image, "interactive");
+    if (!scanned) throw new Error("Vision busy");
+    const { scene, timing } = scanned;
     trackPipeline(s, "vision", "done", timing.ms, `${scene.objects.length} objects`);
 
     trackPipeline(s, "plan", "start");
@@ -646,6 +627,16 @@ export function hearUtterance(s: Session, transcript: string): ListenResponse {
 
 /** Run a spoken or typed intent on the server; replies reach the phone and stage as `say` events. */
 export async function dispatchIntent(s: Session, intent: VoiceIntent): Promise<void> {
+  const needsAck =
+    intent.type === "start_quest" || intent.type === "ask" || intent.type === "describe";
+  const startedAt = s.lastSayAt;
+  const ack = needsAck
+    ? setTimeout(() => {
+        if (s.lastSayAt <= startedAt) {
+          say(s, intent.type === "start_quest" ? "One sec." : "Let me look.", "system", undefined, true);
+        }
+      }, 1500)
+    : null;
   try {
     switch (intent.type) {
       case "start_quest":
@@ -662,6 +653,9 @@ export async function dispatchIntent(s: Session, intent: VoiceIntent): Promise<v
     }
   } catch (err) {
     console.warn("[voice]", redact((err as Error).message).slice(0, 160));
+    say(s, "Sorry, I lost that one. Can you say it again?", "system", undefined, true);
+  } finally {
+    if (ack) clearTimeout(ack);
   }
 }
 
@@ -678,17 +672,19 @@ export async function surveySurroundings(only?: Session) {
   if (surveying || visionMode() === "mock") return;
   const targets = only
     ? [only]
-    : [...sessions.values()].filter((s) => s.status !== "planning" && (s.status === "active" || s.subscribers.size > 0));
+    : [...sessions.values()].filter((s) => s.status !== "planning" && s.status !== "active" && s.subscribers.size > 0);
   if (!targets.length) return;
   const frame = await fetchCameraFrame();
-  const image = frame?.image ?? (only ? await resolveFrame(only) : null);
+  const image = frame?.image;
   if (!image) return;
   const fresh = targets.filter((s) => only || frame?.frameId !== s.surveyFrameId);
   if (!fresh.length) return;
 
   surveying = true;
   try {
-    const { scene } = await scanScene(image);
+    const scanned = await scanScene(image, "background");
+    if (!scanned) return;
+    const { scene } = scanned;
     for (const s of fresh) {
       if (frame) s.surveyFrameId = frame.frameId;
       s.scene = scene;
@@ -703,7 +699,7 @@ export async function surveySurroundings(only?: Session) {
 
 // ---------- Commands ----------
 
-export async function runCommand(s: Session, type: CommandType, image?: string): Promise<void> {
+export async function runCommand(s: Session, type: CommandType): Promise<void> {
   switch (type) {
     case "repeat":
       say(s, s.lastSay || currentStep(s)?.instruction || "No quest yet. Tell me what you want to do.", "system", undefined, true);
@@ -737,7 +733,7 @@ export async function runCommand(s: Session, type: CommandType, image?: string):
         s.status = "active";
         resetStepState(s);
         pushSnapshot(s);
-        say(s, `Onward. ${currentStep(s)?.instruction ?? ""}`, "system", undefined, true);
+        say(s, `Next step. ${currentStep(s)?.instruction ?? ""}`, "system", undefined, true);
       }
       return;
     case "stop":
@@ -748,7 +744,7 @@ export async function runCommand(s: Session, type: CommandType, image?: string):
       s.missions = [];
       s.map = buildMap(null, s.scene);
       pushSnapshot(s);
-      say(s, "Quest abandoned. Rest well, hero.", "system", undefined, true);
+      say(s, "Quest stopped. I'm here if you need me.", "system", undefined, true);
       return;
     case "reset":
       s.status = "idle";
@@ -762,13 +758,18 @@ export async function runCommand(s: Session, type: CommandType, image?: string):
       pushSnapshot(s);
       return;
     case "describe": {
-      const frame = await resolveFrame(s, image);
+      const frame = await cameraFrame();
       if (!frame) {
         say(s, "Point the phone ahead and ask again.", "system", undefined, true);
         return;
       }
       trackPipeline(s, "vision", "start");
-      const { scene, timing } = await scanScene(frame);
+      const scanned = await scanScene(frame, "interactive");
+      if (!scanned) {
+        say(s, "Give me a second and try again.", "system", undefined, true);
+        return;
+      }
+      const { scene, timing } = scanned;
       trackPipeline(s, "vision", "done", timing.ms, `${scene.objects.length} objects`);
       const line = await describeScene(scene);
       say(s, line.text, line.source, undefined, true);

@@ -1,5 +1,6 @@
-"""FastAPI app: serves the phone/viewer pages, relays WebRTC signaling, and
-collects video frames for a vision-capable Llama model."""
+"""FastAPI camera server: serves the phone controller and the live viewer, relays WebRTC
+signaling, buffers the phone's frames for the game's Vision Agent, and proxies the phone's
+voice and narration to the game API."""
 
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from pydantic import BaseModel, Field
 
 from .config import ROOT_DIR, settings
 from .frames import FrameBuffer, prepare_image
-from .llama import DEFAULT_SYSTEM_PROMPT, LlamaError, LlamaVisionClient
 from .network import lan_ip
 from .relay import FrameRelay
 from .signaling import ROLES, SignalingHub
@@ -39,7 +39,6 @@ frames = FrameBuffer(
     jpeg_quality=settings.frame_jpeg_quality,
     save_dir=settings.save_frames_dir,
 )
-llama = LlamaVisionClient(settings)
 
 
 def phone_url(room: str = "default") -> str:
@@ -71,7 +70,6 @@ async def info(room: str = "default") -> dict:
         "room": room,
         "peers": hub.peers(room),
         "frames_buffered": len(frames),
-        "llama": {"base_url": settings.llama_base_url, "model": settings.llama_model},
     }
 
 
@@ -83,14 +81,9 @@ async def qr_svg(room: str = "default") -> Response:
     return Response(buf.getvalue(), media_type="image/svg+xml")
 
 
-@app.get("/api/frames")
-async def list_frames(limit: int = Query(10, ge=1, le=500)) -> list[dict]:
-    return [f.metadata() for f in frames.latest(limit)]
-
-
 @app.get("/api/frames/latest")
 async def latest_frame(include_image: bool = True, max_side: int | None = Query(None, ge=64, le=4096)) -> dict:
-    """Newest frame, already prepared for Llama (base64 JPEG + data URL).
+    """Newest frame as base64 JPEG (+ data URL). The game API polls this for the Vision Agent.
 
     ``max_side`` returns a smaller copy, e.g. for low-latency vision calls."""
     latest = frames.latest(1)
@@ -116,30 +109,6 @@ async def latest_frame_jpeg() -> Response:
     return Response(latest[0].jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/frames/{frame_id}.jpg")
-async def frame_jpeg(frame_id: int) -> Response:
-    frame = frames.get(frame_id)
-    if frame is None:
-        raise HTTPException(404, "Frame not in buffer")
-    return Response(frame.jpeg, media_type="image/jpeg")
-
-
-class AnalyzeRequest(BaseModel):
-    prompt: str = Field("What do you see?", min_length=1, max_length=4000)
-    num_frames: int = Field(1, ge=1, le=8, description="Newest N frames to attach (Ollama's llama3.2-vision accepts 1)")
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT
-
-
-@app.post("/api/analyze")
-async def analyze(req: AnalyzeRequest) -> dict:
-    selected = frames.latest(req.num_frames)
-    try:
-        answer = await llama.analyze(req.prompt, selected, req.system_prompt)
-    except LlamaError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    return {"answer": answer, "model": settings.llama_model, "frame_ids": [f.frame_id for f in selected]}
-
-
 # ------------------------------------------------- sidequest game (voice in, narration out)
 # The game API binds to loopback so only this machine can spend its API quota. The phone
 # can only reach this server, so its microphone audio and narration stream pass through.
@@ -162,13 +131,15 @@ async def game_voice(request: Request, session: str | None = None) -> Response:
     if not audio or len(audio) > _MAX_VOICE_BYTES:
         raise HTTPException(413 if audio else 400, "Send 1 byte to 10 MB of WAV audio")
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=25) as client:
             upstream = await client.post(
                 f"{settings.sidequest_api_url}/api/voice/listen",
                 params={"sessionId": _game_session(session)},
                 content=audio,
                 headers={"Content-Type": "audio/wav"},
             )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Transcription timed out") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Sidequest game API unreachable at {settings.sidequest_api_url}") from exc
     return Response(upstream.content, status_code=upstream.status_code, media_type="application/json")
@@ -176,6 +147,19 @@ async def game_voice(request: Request, session: str | None = None) -> Response:
 
 class GameText(BaseModel):
     text: str = Field(min_length=1, max_length=500)
+
+
+@app.get("/api/game/tts/{line_id}")
+async def game_tts(line_id: str) -> Response:
+    """Stream narration audio for a server-issued line id."""
+    if not re.match(r"^ln[\w-]{1,48}$", line_id):
+        raise HTTPException(400, "Invalid line id")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            upstream = await client.get(f"{settings.sidequest_api_url}/api/tts/{line_id}")
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Sidequest game API unreachable at {settings.sidequest_api_url}") from exc
+    return Response(upstream.content, status_code=upstream.status_code, media_type=upstream.headers.get("content-type", "audio/mpeg"))
 
 
 @app.post("/api/game/text")
@@ -262,7 +246,7 @@ async def relay(ws: WebSocket, room: str, role: str = Query(...)) -> None:
 
 @app.websocket("/ws/frames")
 async def frame_ingest(ws: WebSocket) -> None:
-    """Viewer pushes encoded JPEG snapshots (binary messages); we ack with metadata."""
+    """The phone pushes one JPEG snapshot a second (binary messages); we ack with metadata."""
     await ws.accept()
     try:
         while True:

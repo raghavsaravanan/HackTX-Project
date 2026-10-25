@@ -10,7 +10,7 @@ import type {
   VisionCheck,
   VisionTiming,
 } from "../../../shared/types.ts";
-import { CheckDetail, QuestMap } from "../lib/QuestMap.tsx";
+import { CheckDetail, QuestMap } from "./QuestMap.tsx";
 import { SOURCE_LABEL, sessionIdFromUrl, type Health } from "../lib/api.ts";
 import { playSfx, unlockAudio } from "../lib/sfx.ts";
 import { narrator } from "../lib/speech.ts";
@@ -66,6 +66,10 @@ export function Stage({ health }: { health: Health | null }) {
     return () => window.clearInterval(t);
   }, []);
 
+  useEffect(() => {
+    narrator.setCloudVoice(Boolean(health?.speak && !/on-device/i.test(health.speak)));
+  }, [health?.speak]);
+
   const snapshot = useSession(sessionId, "stage", (e: ServerEvent) => {
     switch (e.type) {
       case "frame":
@@ -77,8 +81,15 @@ export function Stage({ health }: { health: Health | null }) {
         break;
       case "say":
         setSubtitle({ text: e.text, source: e.source, key: Date.now() });
-        if (sound.voice) narrator.say(e.text, e.priority);
+        if (sound.voice) narrator.say(e.text, e.priority, e.id);
         if (sound.sfx) playSfx(e.sfx);
+        break;
+      case "guide":
+        if (sound.voice && e.guidance.say) narrator.guide(e.guidance.say, e.speakId, e.guidance.phase, e.guidance.pan);
+        break;
+      case "snapshot":
+        narrator.setCloudVoice(Boolean(e.snapshot.cloudVoice));
+        if (e.snapshot.status === "planning" || e.snapshot.status === "active") setQuestDone(null);
         break;
       case "transcript":
         setTranscript(e.text);
@@ -102,9 +113,6 @@ export function Stage({ health }: { health: Health | null }) {
       }
       case "quest_complete":
         setQuestDone({ title: e.title, recap: e.recap, durationMs: e.durationMs, stats: e.stats });
-        break;
-      case "snapshot":
-        if (e.snapshot.status === "planning" || e.snapshot.status === "active") setQuestDone(null);
         break;
     }
   });
@@ -154,7 +162,7 @@ export function Stage({ health }: { health: Health | null }) {
           <span className="subtitle-source">{SOURCE_LABEL[subtitle?.source ?? "system"]}</span>
         </div>
         <div key={subtitle?.key} className="subtitle-text">
-          {subtitle?.text ?? "Awaiting a hero..."}
+          {subtitle?.text ?? "Waiting for Echo…"}
         </div>
       </footer>
 

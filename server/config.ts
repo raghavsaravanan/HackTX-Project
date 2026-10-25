@@ -5,10 +5,10 @@ const geminiKey = env.GEMINI_API_KEY ?? "";
 
 export const config = {
   port: Number(env.API_PORT ?? 8787),
-  /** Loopback by default: the Vite dev server proxies /api, so nothing else on the LAN can spend your API quota. */
-  host: env.API_HOST ?? (env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1"),
+  /** Loopback by default: the hub's Vite server proxies /api, so nothing else on the LAN can spend your API quota. */
+  host: env.API_HOST ?? "127.0.0.1",
   agent: {
-    /** Wake phrase is "hi <name>"; the narrator persona is "Sir <name>". */
+    /** Wake phrase is "hi <name>"; the narrator persona uses this name (default Echo). */
     name: env.AGENT_NAME?.trim() || "Echo",
     /** After the wake phrase or a reply, follow-ups within this window need no wake phrase. */
     awakeMs: Number(env.AWAKE_MS ?? 20000),
@@ -44,13 +44,19 @@ export const config = {
   },
   /** How often the Vision Agent re-surveys the surroundings for the quest map. 0 disables it. */
   surveyIntervalMs: Number(env.SURVEY_INTERVAL_MS ?? 15000),
+  elevenlabs: {
+    apiKey: env.ELEVENLABS_API_KEY ?? "",
+    /** Premade voice; override in .env (ElevenLabs voice library). */
+    voiceId: env.ELEVENLABS_VOICE_ID ?? "EXAVITQu4vr4xnSDxMaL",
+    model: env.ELEVENLABS_MODEL ?? "eleven_flash_v2_5",
+  },
   game: {
     /** A single observation at or above this confidence completes a step. */
     instantDoneConfidence: 0.85,
     /** Two consecutive observations at or above this confidence complete a step. */
     doneConfidence: 0.6,
     /** Seconds on a step before the narrator offers a hint. */
-    hintAfterSec: 14,
+    hintAfterSec: 20,
     /** Ask the Vision Agent to confirm a step before awarding it. VERIFY_STEPS=0 trusts the frame loop alone. */
     verifySteps: env.VERIFY_STEPS !== "0",
     /** Minimum wait after a FAIL or UNCERTAIN before the same step is re-verified. */
@@ -61,6 +67,7 @@ export const config = {
 };
 
 export const hasMuse = () => config.muse.apiKey.length > 0;
+export const hasElevenLabs = () => config.elevenlabs.apiKey.length > 0;
 export const hasGemini = () => config.gemini.questApiKey.length > 0 || config.gemini.visionApiKey.length > 0;
 
 export function visionMode(): "gemini" | "muse" | "mock" {
@@ -78,7 +85,7 @@ const KEY_PATTERNS = [/AIza[0-9A-Za-z_-]{20,}/g, /AQ\.[0-9A-Za-z_-]{20,}/g, /LLM
 /** Scrubs API keys from text that may reach logs or HTTP responses. */
 export function redact(text: string): string {
   let out = text;
-  const keys = [config.muse.apiKey, config.gemini.apiKey, config.gemini.questApiKey, config.gemini.visionApiKey];
+  const keys = [config.muse.apiKey, config.gemini.apiKey, config.gemini.questApiKey, config.gemini.visionApiKey, config.elevenlabs.apiKey];
   for (const key of keys) if (key) out = out.split(key).join("[redacted]");
   for (const pattern of KEY_PATTERNS) out = out.replace(pattern, "[redacted]");
   return out;

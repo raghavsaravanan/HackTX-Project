@@ -14,10 +14,13 @@ export interface Health {
   agent: { name: string; wakePhrase: string };
   muse: string;
   transcribe: string;
+  speak?: string;
   vision: string;
   quest: string;
   gemini: boolean;
   verifySteps: boolean;
+  visionNote?: string;
+  visionQueue?: { interactive: number; background: number };
   cameraLink: { url: string; reachable: boolean; lastFrameAgeMs: number | null } | null;
 }
 
@@ -36,9 +39,9 @@ const getJson = <T,>(url: string) =>
 export const api = {
   health: () => getJson<Health>("/api/health"),
   cameraInfo: () => getJson<CameraInfo>("/api/info"),
-  ask: (sessionId: string, text: string, image?: string) => post<AskResponse>("/api/agent/ask", { sessionId, text, image }),
-  verifyMission: (sessionId: string, stepId: string, image?: string) =>
-    post<{ check: VisionCheck; snapshot: SessionSnapshot }>("/api/mission/verify", { sessionId, stepId, image }),
+  ask: (sessionId: string, text: string) => post<AskResponse>("/api/agent/ask", { sessionId, text }),
+  verifyMission: (sessionId: string, stepId: string) =>
+    post<{ check: VisionCheck; snapshot: SessionSnapshot }>("/api/mission/verify", { sessionId, stepId }),
 };
 
 /** Subscribe to session events. Returns an unsubscribe function. EventSource reconnects on its own. */

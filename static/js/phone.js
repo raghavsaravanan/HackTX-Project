@@ -1,6 +1,6 @@
-// Phone page: capture the camera with getUserMedia() and send it to the viewer
-// over a direct WebRTC peer connection, falling back to JPEG frames relayed
-// through the server whenever the direct link isn't connected.
+// Phone controller: capture the camera, send one frame a second to the camera server for
+// the agents, and stream live video to the hub's Live camera tab over WebRTC (falling back
+// to JPEG frames relayed through the server while the direct link isn't connected).
 import { RTC_CONFIG, Signaling, roomFromUrl, setStatus, wsUrl } from "./common.js";
 import { initGameVoice } from "./voice.js";
 
@@ -15,6 +15,7 @@ let stream = null;
 let pc = null;
 let facingMode = "environment";
 let viewerPresent = false;
+const CAMERA_ON = "Camera on. The laptop is receiving frames.";
 // ?mode=relay skips WebRTC entirely (for networks that block device-to-device traffic).
 const relayOnly = new URLSearchParams(location.search).get("mode") === "relay";
 
@@ -46,7 +47,7 @@ async function startCamera() {
   startBtn.textContent = "Restart camera";
   flipBtn.disabled = false;
   startAnalysis();
-  if (pc?.connectionState !== "connected") startRelay();
+  if (viewerPresent && pc?.connectionState !== "connected") startRelay();
 
   const track = stream.getVideoTracks()[0];
   const sender = pc?.getSenders().find((s) => s.track?.kind === "video");
@@ -55,7 +56,7 @@ async function startCamera() {
   } else if (viewerPresent) {
     await call();
   } else {
-    setStatus(statusEl, "Camera on. Waiting for the laptop viewer to connect…", "warn");
+    setStatus(statusEl, CAMERA_ON, "ok");
   }
 }
 
@@ -180,19 +181,25 @@ async function onSignal(msg) {
   switch (msg.type) {
     case "welcome":
       viewerPresent = msg.peers.includes("viewer");
-      if (viewerPresent && stream) await call();
+      if (viewerPresent && stream) {
+        startRelay();
+        await call();
+      }
       else if (!stream) setStatus(statusEl, "Connected to the laptop. Tap Start.", "idle");
       break;
     case "peer-joined":
       viewerPresent = true;
-      if (stream) await call();
+      if (stream) {
+        startRelay();
+        await call();
+      }
       break;
     case "peer-left":
       viewerPresent = false;
       pc?.close();
       pc = null;
-      startRelay();
-      setStatus(statusEl, "Laptop viewer disconnected. Waiting…", "warn");
+      stopRelay();
+      if (stream) setStatus(statusEl, CAMERA_ON, "ok");
       break;
     case "answer":
       // An answer to an offer we've since replaced would break the newer connection.

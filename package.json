@@ -8,7 +8,6 @@
     "dev:server": "tsx watch --env-file-if-exists=.env server/index.ts",
     "dev:web": "vite",
     "build": "vite build",
-    "start": "NODE_ENV=production tsx --env-file-if-exists=.env server/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
