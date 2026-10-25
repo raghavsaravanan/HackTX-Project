@@ -127,7 +127,7 @@ export function Stage({ health }: { health: Health | null }) {
     <div className="stage">
       <header className="stage-header">
         <span className="brand-tag">
-          Say “{snapshot?.wakePhrase ?? "Hi Lumi"}, …” on the phone. Muse hears, Gemini sees and guides.
+          Say “{snapshot?.wakePhrase ?? "Hi Lumi"}, …” on the phone. Lumi shows what it hears, sees, and decides in real time.
         </span>
         <div className="header-right">
           <StatusPill status={snapshot?.status ?? "idle"} />
@@ -158,8 +158,8 @@ export function Stage({ health }: { health: Health | null }) {
       <footer className="subtitle-bar">
         {transcript && <div className="you-said">Player: “{transcript}”</div>}
         <div className="subtitle-speaker">
-          {snapshot?.narratorName ?? "Sir Lumi"}
-          <span className="subtitle-source">{SOURCE_LABEL[subtitle?.source ?? "system"]}</span>
+          {snapshot?.narratorName ?? "Lumi"}
+          {subtitle && subtitle.source !== "system" && <span className="subtitle-source">{SOURCE_LABEL[subtitle.source]}</span>}
         </div>
         <div key={subtitle?.key} className="subtitle-text">
           {subtitle?.text ?? "Waiting for Lumi…"}
@@ -305,7 +305,7 @@ function PausedQuests({ snapshot }: { snapshot: SessionSnapshot | null }) {
   if (!saved.length) return null;
   return (
     <div className="paused-quests">
-      <div className="panel-title">Paused</div>
+      <div className="panel-title">Remembered for later</div>
       <ul>
         {saved.map((q) => (
           <li key={q.questId}>
@@ -401,17 +401,17 @@ function PlayerPanel({ snapshot }: { snapshot: SessionSnapshot | null }) {
 
 function PipelinePanel({ pipeline, health }: { pipeline: PipelineState; health: Health | null }) {
   const rows: { key: PipelineStage; verb: string; model: string }[] = [
-    { key: "transcribe", verb: "Hear", model: health?.transcribe ?? "Muse Voice Transcribe" },
-    { key: "vision", verb: "See", model: health?.vision ?? "Gemini Vision Agent" },
-    { key: "verify", verb: "Verify", model: health?.vision ?? "Gemini Vision Agent" },
-    { key: "plan", verb: "Plan", model: health?.quest ?? "Gemini Quest Agent" },
-    { key: "agent", verb: "Answer", model: health?.quest ?? "Gemini Quest Agent" },
-    { key: "narrate", verb: "Narrate", model: health?.quest ?? "Gemini Quest Agent" },
-    { key: "hint", verb: "Hint", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "transcribe", verb: "Heard", model: health?.transcribe ?? "Muse Voice Transcribe" },
+    { key: "agent", verb: "Understood", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "plan", verb: "Planned", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "vision", verb: "Saw", model: health?.vision ?? "Gemini Vision Agent" },
+    { key: "narrate", verb: "Guided", model: health?.quest ?? "Gemini Quest Agent" },
+    { key: "verify", verb: "Verified", model: health?.vision ?? "Gemini Vision Agent" },
+    { key: "hint", verb: "Adapted", model: health?.quest ?? "Gemini Quest Agent" },
   ];
   return (
     <section className="card">
-      <div className="panel-title">AI pipeline</div>
+      <div className="panel-title">How Lumi reached this guidance</div>
       <ul className="pipeline">
         {rows.map((r) => {
           const p = pipeline[r.key];

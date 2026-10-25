@@ -3,13 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Sidequest controller</title>
+  <meta name="theme-color" content="#f4f1e9">
+  <title>Lumi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body class="phone">
   <main>
     <header>
-      <h1>Sidequest</h1>
+      <h1 class="lumi-brand">
+        <svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M6.8 20.2c0-7.4 4.8-13.1 11.6-13.1 4.3 0 7.5 2.1 7.5 5.6 0 3.1-2.3 5.1-5.9 5.1h-2.5c-2.2 0-3.4 1.1-3.4 2.9 0 2 1.6 3.4 4 3.4 2.8 0 5.1-1.3 7-3.8-.7 6-4.5 9.2-10 9.2-5 0-8.3-3.6-8.3-9.3Z" fill="currentColor"/><path d="M5.4 7.7c2.3.6 4 2.3 4.6 4.6.6-2.3 2.3-4 4.6-4.6-2.3-.6-4-2.3-4.6-4.6-.6 2.3-2.3 4-4.6 4.6Z" fill="currentColor"/></svg>
+        Lumi
+      </h1>
       <span class="room">room <code id="room"></code></span>
     </header>
 
@@ -41,7 +48,7 @@
     <p id="status" class="status" data-state="idle">Connecting to server…</p>
 
     <form id="typed" class="row">
-      <input id="typed-text" placeholder="Or type to the agent" autocomplete="off">
+      <input id="typed-text" placeholder="Or type to Lumi" autocomplete="off">
       <button class="primary" type="submit">Send</button>
     </form>
 
@@ -58,7 +65,7 @@
         </select>
       </div>
     </details>
-    <p class="hint">Point the back camera at the room and keep this tab open. The screen stays on while the quest runs.</p>
+    <p class="hint">Point the back camera at the room and keep this tab open. The screen stays on while Lumi guides you.</p>
   </main>
   <script type="module" src="/static/js/phone.js"></script>
 </body>
