@@ -6,7 +6,7 @@
 
 Lumi turns a phone camera into calm, spoken, step-by-step guidance for people who are blind or have low vision.
 
-🏆 **Built at [HackTX](https://hacktx.com) 2026** at the University of Texas at Austin
+**Built at [HackTX](https://hacktx.com) 2026** at the University of Texas at Austin
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
 ![React](https://img.shields.io/badge/React_19-20232A?logo=react&logoColor=61DAFB)
