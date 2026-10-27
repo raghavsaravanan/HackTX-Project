@@ -1,164 +1,143 @@
-# Sidequest — HackTX 2026
+# Lumi
 
-Everyday tasks become voice-guided quests for blind players. The phone is a hands-free controller: point its camera at the room and say “Hi Echo, help me tidy my desk.” Muse Spark hears, sees, and guides.
+**See the room. Hear the way.**
+
+Lumi turns a phone camera into calm, spoken, step-by-step guidance for people who are blind or have low vision. Hold the phone at chest height, say *"Hi Lumi, help me throw away my coffee,"* and Lumi finds the cup, guides your hand to it, and leads you to the trash. It confirms each step on camera before moving on.
+
+Built at HackTX 2026.
+
+> Lumi supplements a cane, a guide dog, and orientation and mobility training. It is not an obstacle-avoidance system.
+
+## How it works
+
+1. **Perceive.** The phone sends one camera frame per second. While a task is running, Lumi analyzes the newest frame at most every 2.5 seconds.
+2. **Understand.** The **Vision Agent** locates the target and the user's hand, estimates direction and distance, and flags hazards (sharp, hot, fragile, or a trip risk).
+3. **Guide.** The **Quest Agent** plans the task using only objects the camera has seen or the user named, then speaks one short, touch-based step at a time. Stereo beeps pan toward the target and get faster and higher as the hand gets closer.
+4. **Verify.** When a step looks done, the Vision Agent answers a yes/no check with `PASS`, `FAIL`, or `UNCERTAIN`. Only `PASS` advances the task. A verdict below 0.55 confidence counts as `UNCERTAIN`, and Lumi asks the user to adjust instead of guessing.
+5. **Map.** The laptop dashboard builds an approximate 3D model of the room from a single viewpoint. Each object is labeled observed, estimated, or seen earlier. Objects the task expects but the camera hasn't seen are listed, not drawn.
+
+Users can ask questions at any time (*"Is the desk clear?"*, *"Where are my headphones?"*). For 20 seconds after Lumi speaks, follow-ups don't need the wake phrase. Starting a new task always does. When a task is finished, Lumi can offer to text a contact through the Mac's Messages app, and it only sends after the user confirms.
+
+## Architecture
+
+```
+Phone (Safari/Chrome, HTTPS)         Camera server (Python, :8443/:8000)     Game API (Node, 127.0.0.1:8787)
+────────────────────────────         ───────────────────────────────────     ───────────────────────────────
+camera ── 1 JPEG/s ── WS /ws/frames ─► frame ring buffer ◄─── polled ──────── Vision Agent   (Muse Spark)
+mic ── voice detector ── 16 kHz WAV ─► /api/game/voice ─── proxy ──────────► Muse Voice Transcribe
+type box ───────────────────────────► /api/game/text ──── proxy ──────────► Quest Agent    (Muse Spark)
+speaker ◄── narration, beeps ◄──────── /api/game/events ◄─ proxy ◄───────── session events, ElevenLabs TTS
+
+Laptop hub (React, Vite, http://localhost:5173) proxies both servers.
+```
+
+- **The phone only talks to the camera server,** which holds no API keys.
+- **The game API is the only process that calls external services.** It listens on `127.0.0.1`, sends keys in headers, and scrubs them from logs and errors.
+- **The game API owns all task state,** so the phone and the dashboard always agree.
+
+| Job | Service |
+| --- | --- |
+| Quest Agent (plan, narrate, hint, answer) | Meta **Muse Spark** |
+| Vision Agent (step observations, room surveys, PASS/FAIL checks) | Meta **Muse Spark** vision |
+| Speech to text, with the wake word and task objects as keywords | Meta **Muse Voice Transcribe** |
+| Narrator voice | **ElevenLabs** `eleven_flash_v2_5` (browser speech as fallback) |
+| Wake phrase, beeps, voice detection | Local code, no API |
+
+Gemini and OpenAI are optional alternatives for either agent (`QUEST_AGENT_PROVIDER`, `VISION_PROVIDER`). Muse Spark is the default and the fallback.
 
 ## Quick start
 
+Requirements: Node 22.9+, Python 3.10+, and a phone on the same Wi-Fi as the laptop.
+
 ```bash
-cp .env.example .env            # one file configures both apps; blank keys fall back to mock mode
+cp .env.example .env                 # add keys; with no keys, Lumi runs on scripted mock vision
 npm install
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-npm run dev                     # game API on 127.0.0.1:8787 + laptop hub on http://localhost:5173
-.venv/bin/python run.py         # camera server: phone on https://<lan-ip>:8443, laptop side on 127.0.0.1:8000
+npm run dev                          # game API (:8787) + laptop hub (http://localhost:5173)
+.venv/bin/python run.py              # camera server (phone: https://<lan-ip>:8443)
 ```
 
-Open **`http://localhost:5173`** on the laptop, which is the only laptop link. Click **Begin a session** and scan the QR code with the phone, on the same Wi-Fi, and accept the certificate warning once. Without any API keys, everything runs on scripted mock vision so you can rehearse the demo.
+1. Open **http://localhost:5173** on the laptop and go to **Connect**.
+2. Scan the QR code with the phone and accept the certificate warning once.
+3. Tap **Start** on the phone. This is the only tap; it enables the camera and microphone and keeps the screen awake.
+4. Say **"Hi Lumi, help me tidy my desk."** The hub moves to **Live** automatically.
 
-## The journey
-
-The agent is called **Echo** (`AGENT_NAME`).
-
-1. Start both apps and open the hub on the laptop.
-2. Click **Begin a session** and scan the QR code.
-3. Tap **Start** on the phone. This is the only tap: it turns on the camera and microphone and keeps the screen awake. Starting a task (by voice, or typed on the Begin page) moves the hub on to Perceive.
-4. Say **“Hi Echo, help me tidy my desk.”** The Vision Agent surveys the room, and the Quest Agent builds a quest from what it actually sees and speaks the first step. “Hi Echo” on its own gets a chime and a “Yes?”.
-5. Follow the voice. Beeps speed up and pan toward the target. Say “I'm done” after a step, or ask “is the room clean?” or “where are my headphones?”.
-6. For 20 seconds after the wake phrase or a reply (`AWAKE_MS`), follow-ups need no wake phrase. Starting a new quest always needs it, so nearby chatter can't replace the quest.
-
-The phone also has a type box for loud rooms; typed text needs no wake phrase.
+On the phone, a text box handles loud rooms; typed requests don't need the wake phrase.
 
 ## The laptop hub
 
-The hub has three screens: **Overview** (what Lumi is), **Connect** (pair the phone, or type a task), and **Live**, one dashboard for the demo. The phone is where the experience happens; Live shows the technology behind it.
-
-| Live panel | What it shows |
+| Page | Purpose |
 | --- | --- |
-| What Lumi sees | The latest analyzed frame with target, destination, and hand boxes, direction and distance meters, and the cue sent to the phone. Switch to the **3D map** (an approximate model from one viewpoint, rotate/zoom/select) or **Text** (the same spatial information as a table, with read-aloud) |
-| Task | The current touch-based instruction, every step's status, and quick actions (repeat, check, pause, skip) |
-| What Lumi understands | The scene, hazards, where the current target is with its confidence, and the latest Vision Agent verdict |
-
-A bar along the bottom shows what Lumi is saying, has a box to type to Lumi, and can play Lumi's voice on the laptop.
-
-Vite serves the hub and proxies both backends, so nothing else needs opening: the camera server for `/ws/*`, `/api/qr.svg`, `/api/info`, and `/api/frames*`, and the game API for every other `/api/*` route.
-
-## How it fits together
-
-```
- Phone (https://<lan-ip>:8443/phone)          Camera server (Python, app/)            Game API (Node, server/)
- ─────────────────────────────────           ─────────────────────────────           ────────────────────────
- camera ── 1 JPEG/s ── WS /ws/frames ──────► frame buffer ◄── polled ─────────────── Vision Agent (Muse)
- mic ── voice detector ── WAV ── POST /api/game/voice ──► proxy ──► POST /api/voice/listen ── Muse transcribe
- type box ────────────── POST /api/game/text ──► proxy ──► POST /api/say                        │
- speaker ◄── narration, beeps ◄── GET /api/game/events ◄── proxy ◄── session events ◄── Quest Agent (Muse)
-```
-
-The phone only talks to the camera server. That server holds no keys; it forwards game traffic to the game API on `127.0.0.1:8787`, which is the only process that calls external APIs. The game server owns quest progress, step completion, hints, and narration, so the phone and the hub always agree.
-
-### Which API is used where
-
-| Job | Service | Code |
-| --- | --- | --- |
-| Speech to text | Meta **Muse Voice Transcribe** `POST /v1/asr/transcribe` (16 kHz mono WAV, with the agent's name and the quest's objects as keywords) | `server/providers/muse.ts`, `server/index.ts` |
-| Wake phrase and awake window | No API; a pattern match on each transcript | `server/wake.ts`, `hearUtterance` in `server/session.ts` |
-| **Quest Agent**: plans quests, narrates step by step, gives hints, answers questions, asks the Vision Agent to look, updates mission statuses and the map | Meta **Muse Spark** (`MODEL_API_KEY`, `MUSE_MODEL`) | `server/questAgent.ts`, `server/llm.ts`, `server/prompts.ts` |
-| **Vision Agent**: per-frame step observations, room surveys, yes/no checks answered `PASS` / `FAIL` / `UNCERTAIN` with evidence | Meta **Muse Spark** vision (`MODEL_API_KEY`) | `server/vision.ts` |
-| Optional alternative providers (`QUEST_AGENT_PROVIDER` / `VISION_PROVIDER` = `gemini` or `openai`); Muse Spark stays the fallback | Google Gemini or OpenAI | `server/llm.ts`, `server/vision.ts` |
-| Narrator voice | **ElevenLabs** TTS (`ELEVENLABS_API_KEY`) via `GET /api/tts/:id` (cached); browser speech on the phone and hub if no key | `server/providers/elevenlabs.ts`, `server/tts.ts`, `static/js/voice.js`, `web/src/lib/speech.ts` |
-| Directional beeps, voice activity detection | Web Audio on the phone (no API) | `static/js/voice.js` |
-| Phone presence (the hub's "Phone open" status) | A signaling WebSocket the phone page joins (no API) | `app/signaling.py`, `static/js/phone.js` |
-
-### How the agents work together
-
-- **Verified progress.** When the frame loop thinks a step is done, the mission turns `verifying` and the Vision Agent answers that mission's `check`. `PASS` confirms the step (with a chime on the hub) and advances. `FAIL` or `UNCERTAIN` goes back to the Quest Agent, which marks the mission `retry` and speaks a correction. A PASS/FAIL below 0.55 confidence counts as UNCERTAIN. Set `VERIFY_STEPS=0` to trust the frame loop alone.
-- **Questions.** “Is the room clean?”, “Where is the trash can?”, or “I'm done” become an `ask` intent. The Quest Agent answers from quest state or names one yes/no question for the Vision Agent, then reacts to the verdict. Only a Vision Agent `PASS` can complete a mission.
-- **Recognized surroundings, not presets.** Every `SURVEY_INTERVAL_MS` (15 s) the Vision Agent surveys the newest frame: one sentence describing the place plus every object it can see. These become the map's landmarks. Planned quests may only use objects the camera saw or the player named.
-- **Quest map.** Recognized objects are landmarks and missions are tied to them. After the last step the Vision Agent runs the quest's `goalCheck` once.
-- **3D Quest Map, honestly approximate.** There is one phone camera, no depth sensor, no pose, so the hub (`web/src/lib/reconstruct.ts`) builds an approximate model from one viewpoint. Directions come from where things appeared in the frame; distances are ranges, either from the Vision Agent's distance class (the current target) or from how low a thing sits in the frame, assuming it rests between the floor and table height. Each object is marked observed now (live frame), estimated (latest room survey), or earlier view; things the task expects but the camera hasn't seen are listed, never drawn, and everything outside the camera's ~65° view is shown as unobserved. The real camera frame is placed inside the camera's field of view, so markers sit on the rays through where they appeared.
-- **Execution telemetry.** Every outbound model or speech call (Gemini, OpenAI, Muse, ElevenLabs) goes through `server/telemetry.ts`, which reports provider, model, operation, status, latency, a short result summary, fallbacks, and retries to the hub, with no prompts, images, audio, or keys. Together with the stage start/end events this is available for diagnostics; it carries no prompts or keys.
-- **Efficiency.** The phone sends a frame a second; during a task the game API analyzes the newest one every 2.5 s (`CAMERA_LINK_INTERVAL_MS`). Vision uses two lanes: player-driven scans (`inspect`, planning, describe) jump ahead of background frame work, and background observations are dropped when the player is waiting. The phone only sends audio when its voice detector hears speech, and mutes the mic while Echo is talking.
-
-**API keys stay on the laptop.** They are read from `.env` (gitignored) by the game API only, sent in headers (never URLs), and scrubbed from logs and error responses. The game API and the camera server's laptop side bind to `127.0.0.1`, so other devices on the network can't spend your quota.
+| **Overview** | What Lumi is and how it works |
+| **Connect** | Pair the phone by QR code, or type a task |
+| **Live** | One dashboard for the session: the camera view with target, destination, and hand boxes, plus direction and distance meters (switchable to the 3D map or a text view); the task and each step's status; what Lumi understands about the scene, hazards, and the latest verdict; and a live transcript bar with a text box and laptop audio |
 
 ## Configuration
 
-Everything lives in `.env`; `.env.example` documents each variable. The ones you are most likely to change:
+All settings live in `.env`; `.env.example` documents every variable.
 
-| Variable | Default | Effect |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `MODEL_API_KEY` | | Meta Muse key (transcription and fallback brain) |
-| `QUEST_AGENT_PROVIDER`, `VISION_PROVIDER` | `muse` | `muse`, or optionally `gemini` / `openai` (with their keys) |
-| `AGENT_NAME` | `Echo` | Wake phrase is “Hi <name>”; narration persona uses this name |
+| `MODEL_API_KEY` | | Meta Model API key (Muse Spark and Voice Transcribe) |
 | `ELEVENLABS_API_KEY` | | Cloud narrator voice; blank uses on-device speech |
-| `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | premade + `eleven_flash_v2_5` | ElevenLabs voice and low-latency model |
-| `AWAKE_MS` | `20000` | How long follow-ups need no wake phrase |
+| `QUEST_AGENT_PROVIDER`, `VISION_PROVIDER` | `muse` | `muse`, `gemini`, or `openai` (each needs its own key) |
+| `AGENT_NAME` | `Lumi` | Wake phrase is "Hi \<name\>" |
+| `AWAKE_MS` | `20000` | How long follow-ups skip the wake phrase |
 | `VERIFY_STEPS` | `1` | `0` skips Vision Agent confirmation of each step |
-| `SURVEY_INTERVAL_MS` | `15000` | How often the room is re-surveyed for the map |
-| `SIDEQUEST_SESSION` | `demo` | Game session the phone joins (or `?session=` on the phone URL) |
+| `SURVEY_INTERVAL_MS` | `60000` | How often the room is re-surveyed for the map (`0` disables) |
+| `CAMERA_LINK_INTERVAL_MS` | `2500` | Minimum time between analyzed frames during a task |
+| `SHARE_ENABLED`, `SHARE_ONLY_TO` | on, unset | Messages sharing after a task (macOS); `SHARE_ONLY_TO` locks it to one recipient |
+| `SIDEQUEST_SESSION` | `demo` | Session the phone joins (or `?session=` on the phone URL) |
 
 ## Project layout
 
 ```
-server/                 Game API (Node / TypeScript)
-  index.ts              HTTP routes, camera-link polling, survey timer
-  session.ts            Session state: quests, missions, frame loop, wake-phrase listening, events
-  questAgent.ts         Quest Agent: plan, narrate, hint, answer, react to verdicts, intent parsing
-  vision.ts             Vision Agent: step observations, room scans, PASS/FAIL/UNCERTAIN checks
-  llm.ts                Quest Agent model calls (Muse Spark by default; Gemini or OpenAI optional)
-  prompts.ts            All system prompts and JSON schemas
-  providers/            gemini.ts, muse.ts (chat + Voice Transcribe)
-  wake.ts               Wake phrase matching
-  map.ts                Quest map: landmarks, routes, player position
-  guidance.ts           Pan / proximity / phase for directional cues
-  telemetry.ts          Per-call API telemetry for the hub's workflow view
-  cameraLink.ts         Reads the newest phone frame from the camera server
-  presets.ts, mock.ts   Scripted demo quests and mock vision (no keys)
-  config.ts, util.ts
-shared/types.ts         Types shared by the game API and the hub
-web/                    Laptop hub (React, Vite)
-  src/App.tsx           Shell: Overview / Connect / Live tabs, step and task-complete announcements
-  src/pages/            Overview (Discover.tsx) and Connect (Begin.tsx: pairing, starting a task)
-  src/session/          Live dashboard (Live.tsx), pipeline and technical details (Pipeline.tsx),
-                        3D map and text view (Spatial.tsx, Spatial3D.tsx with three.js, lazy-loaded)
-  src/ui/               Brand, icons, verdict chips, the camera view with Vision Agent boxes
-  src/lib/              Shared session state (lumi.tsx), journey routing, spatial readouts, 3D reconstruction (reconstruct.ts),
-                        workflow model (workflow.ts), API client, speech, sounds
-app/                    Camera server (Python / FastAPI)
-  main.py               Phone page, signaling + frame WebSockets, frame API, game proxies
-  signaling.py          Which phone is connected to each room
-  frames.py             Frame ring buffer and preprocessing
-  network.py            LAN IP detection and self-signed certificate
-  config.py             Settings from .env
-static/                 Pages served by the camera server
-  phone.html, js/phone.js, js/voice.js   Phone controller: camera, frames for the agents, listening, narration
-  js/common.js, css/style.css
-scripts/gen_cert.py     Regenerate the HTTPS certificate (after your LAN IP changes)
-tests/test_app.py       Camera server tests (signaling, frames, game proxies)
-run.py                  Starts the camera server's HTTPS and HTTP listeners
+server/        Game API (Node, TypeScript)
+  index.ts       HTTP routes, frame polling, room-survey timer
+  session.ts     Task state, step verification, wake-phrase handling, event stream
+  questAgent.ts  Quest Agent: planning, narration, hints, answers, intent parsing
+  vision.ts      Vision Agent: observations, surveys, PASS/FAIL/UNCERTAIN checks
+  prompts.ts     System prompts and JSON schemas
+  guidance.ts    Direction, proximity, and beep cues
+  share.ts       Optional Messages sharing with explicit confirmation
+  providers/     muse.ts, elevenlabs.ts, messages.ts, gemini.ts, openai.ts
+web/           Laptop hub (React, Vite, three.js)
+  pages/         Overview (Discover.tsx), Connect (Begin.tsx)
+  session/       Live dashboard, 3D map (Spatial3D.tsx), text view
+  lib/           Session state, single-view 3D reconstruction, speech, API client
+app/           Camera server (Python, FastAPI): phone page, WebSockets, frame buffer, proxies
+static/        Phone controller: camera, voice detection, narration, beeps
+shared/        Types shared by the game API and the hub
+tests/         Camera server tests (pytest)
+frontend/      Earlier standalone UI, kept as a design reference (not used at runtime)
 ```
 
 ## Development
 
 ```bash
-npm run typecheck                      # TypeScript
-npm run build                          # check the hub builds (output in dist/, unused at runtime)
+npm run typecheck        # TypeScript
+npm run build            # production build of the hub (output in dist/)
 .venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest
 ```
 
-The camera server's interactive API docs are at `http://localhost:8000/docs`.
+The camera server's API docs are at http://localhost:8000/docs. To rehearse without a live task plan, start a scripted demo task (`desk`, `trash`, or `seat`) from the Connect page or with:
 
-## Demo checklist
-
-- Run the demo on a phone hotspot, not venue Wi-Fi.
-- Stage the desk with a few clear objects (water bottle, trash can, book, backpack).
-- If live planning misbehaves, start a scripted demo task from the Begin page (or `curl -X POST localhost:8787/api/quest/start -H 'Content-Type: application/json' -d '{"sessionId":"demo","presetId":"desk"}'`; `GET /api/presets` lists them).
-- Click **Turn on sound** in the live bar so the audience hears the narrator and the step chimes.
+```bash
+curl -X POST localhost:8787/api/quest/start -H 'Content-Type: application/json' \
+  -d '{"sessionId":"demo","presetId":"trash"}'
+```
 
 ## Troubleshooting
 
-* **“Camera API unavailable” on the phone.** The page isn't on a secure origin. Use the `https://` URL and accept the certificate warning.
-* **Certificate errors after switching networks.** Your LAN IP changed; run `.venv/bin/python scripts/gen_cert.py` and restart. (Or generate `certs/cert.pem` and `certs/key.pem` with [mkcert](https://github.com/FiloSottile/mkcert) and trust its root CA on the phone.)
-* **The hub says “No phone yet” with the phone page open.** Both devices must be on the same Wi-Fi without client isolation, with VPNs off.
-* **Echo doesn't react.** The phone's status line shows what it heard. Start with “Hi Echo”, and check that “Listen for the wake phrase” is on under Settings. A “Voice failed” message means the game API (`npm run dev`) isn't running or Muse is unreachable.
-* **Black video on iPhone after locking the screen.** iOS pauses the camera in background tabs; unlock and tap Restart camera.
-* **macOS asks whether Python may accept incoming connections.** Click Allow.
+- **"Camera API unavailable" on the phone:** open the `https://` URL and accept the certificate warning.
+- **Certificate errors after changing networks:** the laptop's IP changed. Run `.venv/bin/python scripts/gen_cert.py` and restart the camera server.
+- **Hub shows "No phone yet":** both devices must be on the same Wi-Fi, with VPNs off and no client isolation. A phone hotspot is the most reliable option for demos.
+- **Lumi doesn't respond:** start with "Hi Lumi." The phone's status line shows what it heard. "Voice failed" means the game API isn't running or Muse is unreachable.
+- **Black video on iPhone after locking:** iOS pauses the camera in the background. Unlock and tap Restart camera.
+
+## Limitations
+
+- A laptop on the same network must run both servers.
+- Distances come from a single camera with no depth sensor, so they're ranges that assume the phone is held level at chest height.
+- Each analysis takes a few seconds, so Lumi suits deliberate tasks, not fast movement.
